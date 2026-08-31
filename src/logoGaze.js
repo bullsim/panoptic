@@ -1,3 +1,5 @@
+import { applyPanopticBranding } from './panopticBrand.js';
+
 const MAX_GAZE_SVG_UNITS = 34;
 const FULL_GAZE_DISTANCE_PX = 320;
 const GAZE_EASING = 0.2;
@@ -6,12 +8,6 @@ const GAZE_EPSILON = 0.08;
 /**
  * Convert a viewport pointer position into a bounded SVG-space gaze offset.
  * The response ramps up near the logo, then caps so the globe stays in the eye.
- *
- * @param {number} clientX - Pointer x coordinate in CSS pixels.
- * @param {number} clientY - Pointer y coordinate in CSS pixels.
- * @param {{left:number, top:number, width:number, height:number}} rect - Logo bounds.
- * @param {number} [maxOffset=MAX_GAZE_SVG_UNITS] - Maximum SVG-space translation.
- * @returns {{x:number, y:number}}
  */
 export function calculateLogoGaze(clientX, clientY, rect, maxOffset = MAX_GAZE_SVG_UNITS) {
   const values = [clientX, clientY, rect?.left, rect?.top, rect?.width, rect?.height, maxOffset];
@@ -33,11 +29,10 @@ export function calculateLogoGaze(clientX, clientY, rect, maxOffset = MAX_GAZE_S
  * Make every same-origin logo object marked with `data-logo-gaze` follow the
  * pointer. Only the globe and its latitude/longitude cage move; the eye shell
  * remains fixed. Returns a cleanup callback.
- *
- * @param {Document|Element} [root=document] - DOM root to search.
- * @returns {() => void}
  */
 export function initLogoGaze(root = document) {
+  applyPanopticBranding(root);
+
   if (typeof window === 'undefined' || !root?.querySelectorAll) return () => {};
 
   const logos = [...root.querySelectorAll('[data-logo-gaze]')];
@@ -106,10 +101,7 @@ export function initLogoGaze(root = document) {
         svg.setAttribute('focusable', 'false');
         svg.querySelector('title')?.remove();
         state.element.replaceChildren(svg);
-        state.parts = [
-          svg.querySelector('#globe'),
-          svg.querySelector('#globe_cage'),
-        ].filter(Boolean);
+        state.parts = [svg.querySelector('#globe'), svg.querySelector('#globe_cage')].filter(Boolean);
         applyTransform(state);
       }
     } catch {
