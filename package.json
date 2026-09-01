@@ -32,7 +32,8 @@
     "visualization"
   ],
   "scripts": {
-    "dev": "vite",
+    "dev": "node scripts/dev-panoptic.mjs",
+    "dev:web": "vite",
     "dev:secure": "./scripts/dev-secure.sh",
     "opensky:import": "./scripts/opensky-import-client.sh",
     "server": "node server/bin/serve.js",

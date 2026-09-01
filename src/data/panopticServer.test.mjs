@@ -2,10 +2,14 @@
 //
 // The load-bearing test here is `cross-host parity`: the SAME
 // server/collectors/celestrak.js, given the same injected upstream, must
-// produce identical results whether it is reached through a Connect-style
-// mount (as the Vite dev server does) or through native node:http dispatch.
-// Everything else in this file guards the routing and lifecycle details that
-// make that possible.
+// produce identical results through BOTH of the runtime's entry points — a
+// Connect-style `mount()` and native node:http `dispatch()`. Everything else in
+// this file guards the routing and lifecycle details that make that possible.
+//
+// Note: Vite no longer executes CelesTrak at all — it proxies to the standalone
+// server (see panopticProxy.test.mjs), so both sides here mount the
+// 'standalone' surface. The parity claim is about the two mounting mechanisms
+// staying interchangeable, which is what lets a future host reuse collectors.
 //
 // No test here touches celestrak.org — the upstream is always injected — and
 // every cache directory is a throwaway mkdtemp.
@@ -172,17 +176,17 @@ test('dispatch filters by surface, and rejects an unknown one', async () => {
   await assert.rejects(() => runtime.dispatch({ url: '/x' }, fakeRes(), 'nonsense'), /unknown surface/);
 });
 
-test('CelesTrak is served on dev and standalone but never on Vite preview', () => {
+test('CelesTrak executes on standalone only — never dev, never preview', () => {
   const runtime = createRuntime([celestrak]);
   const ids = (surface) => runtime.routes(surface).map((r) => r.id);
 
-  assert.deepEqual(ids('dev'), ['celestrak']);
   assert.deepEqual(ids('standalone'), ['celestrak']);
-  assert.deepEqual(ids('preview'), [], 'gaining a standalone host must not enable Vite preview');
+  assert.deepEqual(ids('dev'), [], 'Vite proxies CelesTrak; it must not execute it');
+  assert.deepEqual(ids('preview'), [], 'Vite preview has never served CelesTrak');
 
   // And the connect-mount path agrees — this is what vite.config.js drives.
-  const app = connectApp();
-  assert.deepEqual(runtime.mount(app, 'preview'), []);
+  assert.deepEqual(runtime.mount(connectApp(), 'dev'), []);
+  assert.deepEqual(runtime.mount(connectApp(), 'preview'), []);
 });
 
 // ---------------------------------------------------------------------------
@@ -199,11 +203,11 @@ test('cross-host parity: identical CelesTrak results via Connect mount and node:
   for (const { name, url } of cases) {
     const upstream = async () => new Response(TLE_BODY, { status: 200 });
 
-    // Host A — Connect-style mount, the Vite dev-server path.
+    // Host A — a Connect-style mount, via runtime.mount().
     const a = await scratch();
     const connectRuntime = createRuntime([pinnedCelestrak({ cacheDir: a.dir, fetchImpl: upstream })]);
     const app = connectApp();
-    connectRuntime.mount(app, 'dev');
+    connectRuntime.mount(app, 'standalone');
     const viaConnect = fakeRes();
     await app.handle({ url }, viaConnect);
 
@@ -239,7 +243,7 @@ test('cross-host parity: a warm cache reports HIT on both hosts', async () => {
   const a = await scratch();
   const connectRuntime = createRuntime([pinnedCelestrak({ cacheDir: a.dir, fetchImpl: upstream })]);
   const app = connectApp();
-  connectRuntime.mount(app, 'dev');
+  connectRuntime.mount(app, 'standalone');
   const cold = fakeRes();
   await app.handle({ url: '/api/celestrak/stations' }, cold);
   const warm = fakeRes();

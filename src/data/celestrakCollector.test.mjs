@@ -59,11 +59,12 @@ const get = (ctx, url = '/stations') => {
 test('collector contract matches the plugin it replaced', () => {
   assert.equal(collector.id, 'celestrak');
   assert.equal(collector.route, '/api/celestrak');
-  // Asserted by intent rather than exact list: the set is meant to grow as
-  // hosts are added, but 'preview' must never appear as a side effect. The
-  // plugin this collector replaced registered no preview middleware.
-  assert.ok(collector.surfaces.includes('dev'), 'Vite dev server must keep serving CelesTrak');
+  // Exactly one host executes this route. Vite proxies to the standalone
+  // server rather than running its own copy, so 'dev' must be absent: Vite
+  // registers plugin middlewares BEFORE server.proxy, and a collector left on
+  // 'dev' would silently answer every request instead of the proxy.
   assert.ok(collector.surfaces.includes('standalone'), 'the PANOPTIC Node server must serve CelesTrak');
+  assert.ok(!collector.surfaces.includes('dev'), 'Vite must proxy CelesTrak, never execute it');
   assert.ok(!collector.surfaces.includes('preview'), 'Vite preview must stay unchanged');
 });
 

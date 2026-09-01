@@ -47,12 +47,13 @@ const validEntry = (parsed) => typeof parsed?.body === 'string' && Number.isFini
 export default defineCollector({
   id: 'celestrak',
   route: '/api/celestrak',
-  // 'dev' is the Vite dev-server middleware the original plugin installed.
-  // 'standalone' additionally serves this collector from the PANOPTIC Node
-  // server. 'preview' stays absent deliberately: the plugin this replaced
-  // registered no preview middleware, and nothing here may change that as a
-  // side effect of gaining another host.
-  surfaces: ['dev', 'standalone'],
+  // The standalone PANOPTIC server is now the ONE place this route executes.
+  // 'dev' is deliberately absent: Vite proxies /api/celestrak here instead of
+  // running its own copy. That is not cosmetic — Vite registers plugin
+  // middlewares BEFORE server.proxy, so a collector still mounted on 'dev'
+  // would silently win every request and the proxy would never fire.
+  // 'preview' has never been served and still is not.
+  surfaces: ['standalone'],
 
   /**
    * Per-process state and injected dependencies.

@@ -24,50 +24,28 @@
 
 import { pathToFileURL } from 'node:url';
 import { createStandaloneServer } from '../standalone.js';
+import { readIntEnv, resolveBackendAddress } from '../backendAddress.js';
 
-/** Defaults, kept here so the whole configuration surface is one object. */
-const DEFAULTS = Object.freeze({
-  host: '127.0.0.1',
-  port: 8787,
-  shutdownTimeoutMs: 10_000,
-});
+/** Shutdown grace default; host and port belong to `server/backendAddress.js`. */
+const SHUTDOWN_TIMEOUT_MS_DEFAULT = 10_000;
 
-/**
- * Read an integer from the environment, failing loudly on nonsense.
- *
- * A typo in a port should stop the server, not silently bind somewhere
- * unexpected.
- *
- * @param {Record<string,string|undefined>} env - Environment.
- * @param {string} key - Variable name.
- * @param {number} fallback - Value when unset or empty.
- * @param {{min: number, max: number}} bounds - Accepted range, inclusive.
- * @returns {number} Parsed value.
- */
-export function readIntEnv(env, key, fallback, bounds) {
-  const raw = env[key];
-  if (raw === undefined || String(raw).trim() === '') return fallback;
-  const value = Number(raw);
-  if (!Number.isInteger(value) || value < bounds.min || value > bounds.max) {
-    throw new Error(`${key} must be an integer in [${bounds.min}, ${bounds.max}] — received ${JSON.stringify(raw)}`);
-  }
-  return value;
-}
+export { readIntEnv };
 
 /**
  * Resolve the full server configuration from an environment.
+ *
+ * Host and port come from the shared resolver so the Vite proxy and the dev
+ * launcher cannot end up pointing somewhere this server is not listening.
  *
  * @param {Record<string,string|undefined>} [env] - Environment.
  * @returns {{host: string, port: number, shutdownTimeoutMs: number}} Configuration.
  */
 export function readConfig(env = process.env) {
-  const host = String(env.PANOPTIC_HOST || '').trim() || DEFAULTS.host;
-  // Port 0 is allowed: it asks the OS for an ephemeral port, which tests use.
-  const port = readIntEnv(env, 'PANOPTIC_PORT', DEFAULTS.port, { min: 0, max: 65_535 });
+  const { host, port } = resolveBackendAddress(env);
   const shutdownTimeoutMs = readIntEnv(
     env,
     'PANOPTIC_SHUTDOWN_TIMEOUT_MS',
-    DEFAULTS.shutdownTimeoutMs,
+    SHUTDOWN_TIMEOUT_MS_DEFAULT,
     { min: 0, max: 300_000 },
   );
   return { host, port, shutdownTimeoutMs };
