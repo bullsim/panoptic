@@ -47,10 +47,12 @@ const validEntry = (parsed) => typeof parsed?.body === 'string' && Number.isFini
 export default defineCollector({
   id: 'celestrak',
   route: '/api/celestrak',
-  // Matches today's registration exactly: the plugin this replaced installed a
-  // dev-server middleware only. Adding 'preview'/'standalone' here is how the
-  // next stage widens it — a deliberate change, not a side effect of the move.
-  surfaces: ['dev'],
+  // 'dev' is the Vite dev-server middleware the original plugin installed.
+  // 'standalone' additionally serves this collector from the PANOPTIC Node
+  // server. 'preview' stays absent deliberately: the plugin this replaced
+  // registered no preview middleware, and nothing here may change that as a
+  // side effect of gaining another host.
+  surfaces: ['dev', 'standalone'],
 
   /**
    * Per-process state and injected dependencies.

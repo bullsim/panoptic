@@ -14,6 +14,7 @@
  */
 
 import { promises as fsp } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 
 /**
@@ -49,11 +50,30 @@ export function createTtlCache({ dir, fileName, ttlMs, validate, label, log = co
     return null;
   }
 
+  /**
+   * Write the entry to a private temporary file, then rename it into place.
+   *
+   * `rename` within a directory is atomic on POSIX and on Windows (NTFS), so a
+   * concurrent reader sees either the previous file or the complete new one,
+   * never a half-written body. A plain `writeFile` truncates first and can be
+   * read mid-write — reachable now that a Vite dev server and a standalone
+   * PANOPTIC server can share `.gev-cache/` at the same time.
+   *
+   * The temporary name carries a UUID, so two processes (or two keys racing in
+   * one process) can never collide on the same scratch path. It lives in the
+   * destination directory because `rename` cannot cross filesystems.
+   */
   async function writeDisk(key, entry) {
+    const destination = diskPath(key);
+    const temporary = `${destination}.${randomUUID()}.tmp`;
     try {
       await fsp.mkdir(dir, { recursive: true });
-      await fsp.writeFile(diskPath(key), JSON.stringify(entry), 'utf8');
+      await fsp.writeFile(temporary, JSON.stringify(entry), 'utf8');
+      await fsp.rename(temporary, destination);
     } catch (err) {
+      // Leaving a scratch file behind would leak one per failed write; the
+      // cleanup is best-effort because the failure may be the write itself.
+      await fsp.rm(temporary, { force: true }).catch(() => {});
       log.warn(`[${label}] cache write failed for ${key}:`, err?.message || err);
     }
   }

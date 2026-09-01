@@ -11,7 +11,7 @@
 // Run with: npm test   (node --test)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import collector from '../../server/collectors/celestrak.js';
@@ -59,9 +59,12 @@ const get = (ctx, url = '/stations') => {
 test('collector contract matches the plugin it replaced', () => {
   assert.equal(collector.id, 'celestrak');
   assert.equal(collector.route, '/api/celestrak');
-  // The removed plugin registered configureServer only. Widening this is a
-  // deliberate future change, never a side effect of the extraction.
-  assert.deepEqual([...collector.surfaces], ['dev']);
+  // Asserted by intent rather than exact list: the set is meant to grow as
+  // hosts are added, but 'preview' must never appear as a side effect. The
+  // plugin this collector replaced registered no preview middleware.
+  assert.ok(collector.surfaces.includes('dev'), 'Vite dev server must keep serving CelesTrak');
+  assert.ok(collector.surfaces.includes('standalone'), 'the PANOPTIC Node server must serve CelesTrak');
+  assert.ok(!collector.surfaces.includes('preview'), 'Vite preview must stay unchanged');
 });
 
 test('a malformed group is rejected without consulting the cache', async () => {
@@ -249,6 +252,80 @@ test('distinct groups are cached independently', async () => {
     assert.equal(repeat.headers['x-tle-cache'], 'HIT');
     assert.match(repeat.body, /# stations$/);
   } finally { await cleanup(); }
+});
+
+test('the disk cache is written atomically and leaves no scratch files', async () => {
+  const { ctx, cacheDir, cleanup } = await harness();
+  try {
+    await get(ctx);
+    const entries = await readdir(cacheDir);
+    // Exactly the final name — the temporary file must have been renamed away,
+    // never left behind for a reader to trip over.
+    assert.deepEqual(entries, ['celestrak-stations.json']);
+  } finally { await cleanup(); }
+});
+
+test('a failed disk write cleans up its temporary file and still serves', async () => {
+  const { ctx, cacheDir, cleanup } = await harness();
+  try {
+    // A directory where the cache file belongs makes rename fail while the
+    // temporary write itself succeeds — the exact window a leak would open.
+    await mkdir(path.join(cacheDir, 'celestrak-stations.json'), { recursive: true });
+    const res = await get(ctx);
+    assert.equal(res.status, 200, 'a disk-write failure must not fail the request');
+    assert.equal(res.headers['x-tle-cache'], 'MISS');
+
+    const leaked = (await readdir(cacheDir)).filter((name) => name.endsWith('.tmp'));
+    assert.deepEqual(leaked, [], 'a failed write must not leave a .tmp file behind');
+  } finally { await cleanup(); }
+});
+
+test('concurrent writers never expose a partially written cache file', async () => {
+  // Two PANOPTIC processes (Vite dev + standalone) share .gev-cache. Model that
+  // with two independent contexts over one directory, writing repeatedly while
+  // a third reader parses the file: with a truncate-in-place write this races
+  // into a JSON parse error; with write-then-rename it cannot.
+  const cacheDir = await mkdtemp(path.join(tmpdir(), 'panoptic-celestrak-'));
+  const target = path.join(cacheDir, 'celestrak-stations.json');
+  try {
+    const big = `${TLE_BODY}\n`.repeat(400);
+    const makeCtx = (tag) => collector.createContext({
+      cacheDir,
+      now: () => Date.now(),
+      log: { warn() {} },
+      fetchImpl: async () => new Response(`${big}# ${tag}`, { status: 200 }),
+    });
+
+    let reads = 0;
+    let torn = 0;
+    let stop = false;
+    const reader = (async () => {
+      while (!stop) {
+        try {
+          const raw = await readFile(target, 'utf8');
+          reads += 1;
+          const parsed = JSON.parse(raw);
+          if (typeof parsed.body !== 'string' || !parsed.body.startsWith('ISS')) torn += 1;
+        } catch (err) {
+          // A missing file before the first write is fine; a parse error is not.
+          if (err.code !== 'ENOENT') torn += 1;
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    })();
+
+    for (let round = 0; round < 12; round += 1) {
+      await Promise.all([
+        collector.handler({ url: '/stations' }, fakeRes(), makeCtx(`a${round}`)),
+        collector.handler({ url: '/stations' }, fakeRes(), makeCtx(`b${round}`)),
+      ]);
+    }
+    stop = true;
+    await reader;
+
+    assert.ok(reads > 0, 'the reader must have observed the cache file at least once');
+    assert.equal(torn, 0, 'no reader may ever see a partially written cache file');
+  } finally { await rm(cacheDir, { recursive: true, force: true }); }
 });
 
 test('a query string is stripped from the group', async () => {

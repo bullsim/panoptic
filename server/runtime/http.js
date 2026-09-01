@@ -9,11 +9,15 @@
  */
 
 /**
- * Route-relative path for a request mounted under a connect prefix.
+ * Route-relative path for a request handed to a collector.
  *
- * Connect strips the mount path before invoking the handler, so `req.url` is
- * already relative to the collector's route; this drops the leading slash and
- * any query string.
+ * The runtime guarantees `req.url` is already relative to the collector's own
+ * route, whichever host is serving it — Connect rewrites it when it matches a
+ * mount path, and `dispatch()` does the same for hosts that do not route. This
+ * drops the leading slash and any query string.
+ *
+ * The guarantee belongs to `server/runtime/registry.js`; do not reintroduce a
+ * dependency on one particular host's URL handling here.
  *
  * @param {import('node:http').IncomingMessage} req - Incoming request.
  * @returns {string} Path segment with no leading slash and no query string.
@@ -39,4 +43,19 @@ export function sendText(res, status, body, headers = {}) {
   if (res.headersSent) return;
   res.writeHead(status, { 'Content-Type': 'text/plain', ...headers });
   res.end(body);
+}
+
+/**
+ * Write a JSON response, guarding against a double send.
+ *
+ * @param {import('node:http').ServerResponse} res - Response to write.
+ * @param {number} status - HTTP status code.
+ * @param {unknown} payload - Value to serialize.
+ * @param {Record<string,string>} [headers] - Extra headers merged over the content type.
+ * @returns {void}
+ */
+export function sendJson(res, status, payload, headers = {}) {
+  if (res.headersSent) return;
+  res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
+  res.end(JSON.stringify(payload));
 }
