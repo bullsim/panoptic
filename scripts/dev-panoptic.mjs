@@ -8,14 +8,14 @@
  *   [web]  vite                         the frontend, which proxies /api/* to it
  *
  * Why a launcher rather than two terminals: the Vite proxy target and the
- * backend's bind address must agree, and they resolve from environments that
- * are NOT the same. `vite.config.js` calls Vite's `loadEnv`, which folds `.env`
- * into the config; `server/bin/serve.js` deliberately does not read `.env` yet.
- * A `PANOPTIC_PORT` in `.env` would therefore move the proxy target without
- * moving the server. This launcher resolves the address ONCE and passes the
- * same explicit values to both children, so they cannot diverge.
+ * backend's bind address must agree. Both now resolve through the same rules —
+ * Vite via its own `loadEnv`, PANOPTIC via `server/config` — but agreeing by
+ * coincidence is not a guarantee. This launcher resolves the address ONCE and
+ * passes the same explicit values to both children, so a `PANOPTIC_PORT`
+ * anywhere in the .env chain moves the proxy target and the server together.
  *
- * Zero dependencies: node:child_process plus Vite's own loadEnv.
+ * Zero dependencies: node:child_process plus the PANOPTIC config loader. The
+ * launcher orchestrates processes; it is not a configuration system.
  *
  * Usage:
  *   npm run dev
@@ -29,11 +29,10 @@
  * loopback via the proxy — the backend is never itself LAN-visible.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { loadEnv } from 'vite';
-import { resolveBackendAddress } from '../server/backendAddress.js';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { loadPanopticConfig } from '../server/config/index.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -44,27 +43,67 @@ const VITE_ARGS = process.argv.slice(2);
 const READY_TIMEOUT_MS = 5_000;
 const READY_POLL_MS = 100;
 
+/** POSIX only: how long a child gets to honour SIGTERM before SIGKILL. */
+const FORCE_KILL_AFTER_MS = 5_000;
+
 /**
- * Resolve the backend address the same way `vite.config.js` will.
+ * stdio for both children. stdin is a PIPE we hold open and never write to —
+ * deliberately NOT 'inherit'. See the note on `start()` for why an inherited
+ * console TTY breaks Ctrl-C. Exported so a regression test can pin it.
+ */
+export const CHILD_STDIO = Object.freeze(['pipe', 'pipe', 'pipe']);
+
+/**
+ * Resolve the backend address through the PANOPTIC config loader.
  *
- * `loadEnv(mode, root, '')` reads this checkout's .env files; real environment
- * variables still win, matching the precedence in `vite.config.js`.
+ * The loader applies the same .env precedence Vite does, so the proxy target
+ * and the bind address are decided once, here, from one set of rules.
  *
  * @returns {{host: string, port: number, origin: string, env: Record<string,string>}}
  */
 function resolveEnvironment() {
-  const mode = process.env.NODE_ENV || 'development';
-  const dotenv = loadEnv(mode, ROOT, '');
-  const merged = { ...dotenv, ...process.env };
-  const { host, port, origin } = resolveBackendAddress(merged);
+  const { server } = loadPanopticConfig({ dir: ROOT });
+  const { host, port, origin } = server;
   return {
     host,
     port,
     origin,
     // Explicit values for BOTH children. vite.config.js only copies a .env key
-    // when process.env has none, so these win there too.
+    // when process.env has none, so these win there too — which is what keeps
+    // the Vite proxy and the backend from ever disagreeing.
     env: { ...process.env, PANOPTIC_HOST: host, PANOPTIC_PORT: String(port) },
   };
+}
+
+/**
+ * Stop one child and everything it spawned.
+ *
+ * Windows has no POSIX process groups, and `child.kill()` terminates only the
+ * immediate PID — a tool that spawns helpers (Vite starts an esbuild service)
+ * would leak them. `taskkill /T` walks the descendant tree; `/F` is required
+ * because a console application with no message loop never answers a polite
+ * close request. This cannot touch unrelated processes: the tree is rooted at a
+ * PID this launcher spawned itself, and Windows PIDs are not reused while the
+ * handle is open.
+ *
+ * POSIX keeps the existing SIGTERM — `server/bin/serve.js` handles it and shuts
+ * down gracefully — with a bounded escalation to SIGKILL so a child that ignores
+ * the signal cannot hang the launcher.
+ *
+ * @param {import('node:child_process').ChildProcess} child - Child to stop.
+ * @returns {void}
+ */
+export function stopChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null || !child.pid) return;
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+    return;
+  }
+  child.kill('SIGTERM');
+  const escalate = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }, FORCE_KILL_AFTER_MS);
+  escalate.unref?.();
 }
 
 /** Prefix every line of a child's output so two streams stay readable. */
@@ -92,7 +131,7 @@ async function waitForBackend(origin, deadlineMs) {
   return false;
 }
 
-async function main() {
+export async function main() {
   const { host, port, origin, env } = resolveEnvironment();
   const children = new Map();
   let shuttingDown = false;
@@ -101,19 +140,29 @@ async function main() {
   /** Stop every surviving child once, then let the process end naturally. */
   const stopAll = (except) => {
     for (const [name, child] of children) {
-      if (name === except || child.exitCode !== null || child.signalCode !== null) continue;
-      child.kill();
+      if (name === except) continue;
+      stopChild(child);
     }
   };
 
   // Both children are spawned as `node <script>` — never through a shell or a
   // .cmd shim. On Windows a shim makes the real process a GRANDchild, so
   // child.kill() would kill the shim and leave the server running.
+  //
+  // stdin is a PIPE we hold open and never write to, deliberately NOT 'inherit'.
+  // Vite's bindCLIShortcuts() only engages when `process.stdin.isTTY`, and it
+  // then builds a readline interface over that TTY. Readline takes the console
+  // into raw mode and consumes Ctrl-C itself, so with an inherited console the
+  // event never becomes a process signal and Vite — which registers SIGTERM but
+  // no SIGINT handler — survives Ctrl-C still holding its port. Handing it a
+  // pipe keeps isTTY false, so the shortcuts stay unbound and Ctrl-C reaches the
+  // console group normally. The cost is Vite's r/u/o/q shortcuts under
+  // `npm run dev`; `npm run dev:web` runs Vite directly and still has them.
   const start = (name, prefix, script) => {
     const child = spawn(process.execPath, [script, ...(name === 'web' ? VITE_ARGS : [])], {
       cwd: ROOT,
       env,
-      stdio: ['inherit', 'pipe', 'pipe'],
+      stdio: [...CHILD_STDIO],
     });
     children.set(name, child);
     pipePrefixed(child.stdout, prefix, process.stdout);
@@ -175,7 +224,11 @@ async function main() {
   }, 100);
 }
 
-main().catch((err) => {
-  console.error(`[panoptic] launcher failed: ${err?.message || err}`);
-  process.exit(1);
-});
+// Only self-start when executed directly, never when imported by a test.
+// pathToFileURL handles Windows drive letters and separators correctly.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    console.error(`[panoptic] launcher failed: ${err?.message || err}`);
+    process.exit(1);
+  });
+}

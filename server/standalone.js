@@ -29,13 +29,25 @@ export const HEALTH_ROUTE = '/health';
  *
  * @param {object} [options] - Server options.
  * @param {readonly import('./runtime/registry.js').Collector[]} [options.collectors] - Collectors to serve.
+ * @param {object|null} [options.config] - Loaded PANOPTIC configuration, for health reporting.
  * @param {() => number} [options.now] - Clock, injectable for tests.
  * @param {Pick<Console,'error'>} [options.log] - Log sink for unhandled request errors.
  * @returns {{server: import('node:http').Server, runtime: ReturnType<typeof createRuntime>, routes: {id: string, route: string}[]}}
  */
-export function createStandaloneServer({ collectors = COLLECTORS, now = () => Date.now(), log = console } = {}) {
+export function createStandaloneServer({
+  collectors = COLLECTORS,
+  config = null,
+  now = () => Date.now(),
+  log = console,
+} = {}) {
   const runtime = createRuntime(collectors);
-  const routes = runtime.routes(SURFACE);
+  // Configuration STATE only — an enum per collector, never a value. CelesTrak
+  // needs no configuration at all, which reports as 'not-required'.
+  const routes = runtime.routes(SURFACE).map((route) => ({
+    ...route,
+    configuration: config?.collectors?.[route.id]?.configuration ?? 'not-required',
+  }));
+  const degraded = routes.some((r) => r.configuration === 'missing' || r.configuration === 'invalid');
   const startedAt = now();
 
   const server = http.createServer(async (req, res) => {
@@ -46,7 +58,7 @@ export function createStandaloneServer({ collectors = COLLECTORS, now = () => Da
         // Enough to establish the backend is alive and what it is serving.
         // Deliberately not an observability surface.
         sendJson(res, 200, {
-          status: 'ok',
+          status: degraded ? 'degraded' : 'ok',
           service: 'panoptic',
           surface: SURFACE,
           pid: process.pid,

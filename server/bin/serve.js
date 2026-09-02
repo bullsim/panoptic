@@ -6,50 +6,20 @@
  * signals, and exit codes. Everything it drives is a plain factory, so the
  * server itself stays testable without spawning a process.
  *
- * Environment:
- *   PANOPTIC_HOST                  default 127.0.0.1
- *   PANOPTIC_PORT                  default 8787
- *   PANOPTIC_SHUTDOWN_TIMEOUT_MS   default 10000
+ * Configuration is owned by `server/config` — this file no longer parses the
+ * environment itself. See `server/config/schema.js` for the variables PANOPTIC
+ * owns (PANOPTIC_HOST, PANOPTIC_PORT, PANOPTIC_SHUTDOWN_TIMEOUT_MS).
  *
  * `PORT` and `HOST` are deliberately NOT read: `vite.config.js` already
  * consumes those for the dev server, and sharing them would let one .env
  * configure two servers onto the same port.
- *
- * There is no .env loading here yet. CelesTrak needs no credentials; the
- * collectors that do (OpenSky, TomTom, FIRMS, OpenAI) will need a config
- * loader before they can be migrated.
  *
  * @module server/bin/serve
  */
 
 import { pathToFileURL } from 'node:url';
 import { createStandaloneServer } from '../standalone.js';
-import { readIntEnv, resolveBackendAddress } from '../backendAddress.js';
-
-/** Shutdown grace default; host and port belong to `server/backendAddress.js`. */
-const SHUTDOWN_TIMEOUT_MS_DEFAULT = 10_000;
-
-export { readIntEnv };
-
-/**
- * Resolve the full server configuration from an environment.
- *
- * Host and port come from the shared resolver so the Vite proxy and the dev
- * launcher cannot end up pointing somewhere this server is not listening.
- *
- * @param {Record<string,string|undefined>} [env] - Environment.
- * @returns {{host: string, port: number, shutdownTimeoutMs: number}} Configuration.
- */
-export function readConfig(env = process.env) {
-  const { host, port } = resolveBackendAddress(env);
-  const shutdownTimeoutMs = readIntEnv(
-    env,
-    'PANOPTIC_SHUTDOWN_TIMEOUT_MS',
-    SHUTDOWN_TIMEOUT_MS_DEFAULT,
-    { min: 0, max: 300_000 },
-  );
-  return { host, port, shutdownTimeoutMs };
-}
+import { PanopticConfigError, loadPanopticConfig } from '../config/index.js';
 
 /**
  * Wire SIGINT/SIGTERM to a bounded graceful shutdown.
@@ -103,8 +73,9 @@ export function installShutdown(server, { shutdownTimeoutMs, proc = process, log
 
 /** Boot the server from the ambient environment. */
 export async function main() {
-  const { host, port, shutdownTimeoutMs } = readConfig();
-  const { server, routes } = createStandaloneServer();
+  const config = loadPanopticConfig();
+  const { host, port, shutdownTimeoutMs } = config.server;
+  const { server, routes } = createStandaloneServer({ config });
 
   installShutdown(server, { shutdownTimeoutMs });
 
@@ -129,7 +100,10 @@ export async function main() {
 // pathToFileURL handles Windows drive letters and separators correctly.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((err) => {
-    console.error(`[panoptic] failed to start: ${err?.message || err}`);
+    // A PanopticConfigError already lists every problem it found; anything else
+    // gets the usual one-line treatment.
+    if (err instanceof PanopticConfigError) console.error(`[panoptic] ${err.message}`);
+    else console.error(`[panoptic] failed to start: ${err?.message || err}`);
     process.exit(1);
   });
 }

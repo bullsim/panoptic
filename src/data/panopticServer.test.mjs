@@ -26,7 +26,7 @@ import path from 'node:path';
 import celestrak from '../../server/collectors/celestrak.js';
 import { createStandaloneServer, HEALTH_ROUTE, SURFACE } from '../../server/standalone.js';
 import { createRuntime, defineCollector, routeRemainder } from '../../server/runtime/registry.js';
-import { installShutdown, readConfig, readIntEnv } from '../../server/bin/serve.js';
+import { installShutdown } from '../../server/bin/serve.js';
 
 const TLE_BODY = [
   'ISS (ZARYA)',
@@ -286,7 +286,17 @@ test('health reports a live backend and what it serves', async () => {
     assert.equal(body.pid, process.pid);
     assert.ok(Number.isFinite(Date.parse(body.startedAt)), 'startedAt must be an ISO timestamp');
     assert.ok(Number.isInteger(body.uptimeSeconds) && body.uptimeSeconds >= 0);
-    assert.deepEqual(body.collectors, [{ id: 'celestrak', route: '/api/celestrak' }]);
+    // Configuration STATE only — an enum, never a value. CelesTrak is keyless.
+    assert.deepEqual(body.collectors, [
+      { id: 'celestrak', route: '/api/celestrak', configuration: 'not-required' },
+    ]);
+
+    // Health must never carry configuration values or anything derived from a
+    // secret (length, prefix, hash, file path).
+    const rendered = JSON.stringify(body);
+    for (const forbidden of ['PANOPTIC_HOST', 'PANOPTIC_PORT', '.env', 'secret', 'token', 'key']) {
+      assert.equal(rendered.toLowerCase().includes(forbidden.toLowerCase()), false, `health leaked ${forbidden}`);
+    }
   } finally { await server.close(); await cleanup(); }
 });
 
@@ -336,25 +346,8 @@ test('the standalone route keeps the Vite route\'s method behaviour', async () =
 // Configuration and shutdown
 // ---------------------------------------------------------------------------
 
-test('configuration defaults and overrides', () => {
-  assert.deepEqual(readConfig({}), { host: '127.0.0.1', port: 8787, shutdownTimeoutMs: 10_000 });
-  assert.deepEqual(
-    readConfig({ PANOPTIC_HOST: '0.0.0.0', PANOPTIC_PORT: '9000', PANOPTIC_SHUTDOWN_TIMEOUT_MS: '250' }),
-    { host: '0.0.0.0', port: 9000, shutdownTimeoutMs: 250 },
-  );
-  // PORT/HOST belong to the Vite dev server and must not leak in here.
-  assert.deepEqual(readConfig({ PORT: '5173', HOST: '0.0.0.0' }), readConfig({}));
-});
-
-test('a nonsense port fails fast instead of binding somewhere unexpected', () => {
-  const bounds = { min: 0, max: 65_535 };
-  assert.throws(() => readIntEnv({ PANOPTIC_PORT: 'eight' }, 'PANOPTIC_PORT', 8787, bounds), /must be an integer/);
-  assert.throws(() => readIntEnv({ PANOPTIC_PORT: '99999' }, 'PANOPTIC_PORT', 8787, bounds), /must be an integer/);
-  assert.throws(() => readIntEnv({ PANOPTIC_PORT: '-1' }, 'PANOPTIC_PORT', 8787, bounds), /must be an integer/);
-  assert.throws(() => readIntEnv({ PANOPTIC_PORT: '80.5' }, 'PANOPTIC_PORT', 8787, bounds), /must be an integer/);
-  assert.equal(readIntEnv({ PANOPTIC_PORT: '  ' }, 'PANOPTIC_PORT', 8787, bounds), 8787);
-  assert.equal(readIntEnv({}, 'PANOPTIC_PORT', 8787, bounds), 8787);
-});
+// Configuration parsing moved to server/config — see panopticConfig.test.mjs
+// for precedence, defaults, and fatal-vs-default validation.
 
 test('a signal closes the server cleanly and frees the port', async () => {
   const { server } = createStandaloneServer({ collectors: [], log: silent });
