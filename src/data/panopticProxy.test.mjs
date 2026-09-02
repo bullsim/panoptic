@@ -113,7 +113,10 @@ test('proxy entries are derived from the collector registry', () => {
   const expected = createRuntime(COLLECTORS).routes('standalone').map((r) => proxyContextKey(r.route));
 
   assert.deepEqual(Object.keys(entries).sort(), expected.sort());
-  assert.deepEqual(Object.keys(entries), [proxyContextKey('/api/celestrak')]);
+  assert.deepEqual(
+    Object.keys(entries).sort(),
+    [proxyContextKey('/api/celestrak'), proxyContextKey('/api/firms')].sort(),
+  );
   for (const entry of Object.values(entries)) {
     assert.equal(entry.target, 'http://127.0.0.1:8787');
     assert.equal(entry.changeOrigin, false);
@@ -124,7 +127,9 @@ test('no unrelated Vite API route is intercepted', () => {
   const entries = panopticProxy({});
   // Every route still executed inside vite.config.js must fall through.
   const untouched = [
-    '/api/opensky', '/api/tomtom/status', '/api/firms', '/api/cctv/sources',
+    // /api/firms is deliberately ABSENT: it migrated to the standalone backend
+    // and is now proxied, which the test above asserts.
+    '/api/opensky', '/api/tomtom/status', '/api/cctv/sources',
     '/api/overpass', '/api/ais-live', '/api/realtime/token', '/api/gbfs/x',
     '/api/adsbdb/type/A320', '/api/launches', '/api/radio/stations',
     '/api/terrain/heights', '/api/military-installations', '/api/regional-brief',

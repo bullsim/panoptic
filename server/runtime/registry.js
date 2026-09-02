@@ -92,13 +92,20 @@ export function routeRemainder(pathname, route) {
  * in-flight maps are shared across every host in the process — matching the
  * plugin factories in `vite.config.js`, which close over their state once.
  *
+ * Each collector is handed ONLY its own configuration slice — `config.collectors[id]`
+ * — never the whole tree and never `process.env`. A misconfigured collector can
+ * therefore affect only itself, and a test can build a context by passing one
+ * small object.
+ *
  * @param {readonly Collector[]} collectors - Collectors to instantiate.
+ * @param {object} [options] - Runtime options.
+ * @param {object} [options.config] - Loaded PANOPTIC configuration.
  * @returns {{mount: Function, dispatch: Function, routes: Function}} Runtime handle.
  */
-export function createRuntime(collectors) {
+export function createRuntime(collectors, { config = null } = {}) {
   const instances = collectors.map((collector) => ({
     collector,
-    context: collector.createContext(),
+    context: collector.createContext({ config: config?.collectors?.[collector.id] ?? {} }),
   }));
 
   return {

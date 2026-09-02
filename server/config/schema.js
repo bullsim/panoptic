@@ -11,8 +11,9 @@
  * configuration here for completeness would create two owners for one value,
  * which is precisely the failure mode the migration is meant to avoid.
  *
- * Today that means the three backend process settings. `FIRMS_MAP_KEY` and the
- * OpenSky credentials arrive with their collectors, not before.
+ * Today that means the three backend process settings plus `FIRMS_MAP_KEY`,
+ * which arrived with the FIRMS collector. The OpenSky, TomTom, AISStream and
+ * OpenAI credentials are still Vite's and arrive with their collectors.
  *
  * Imports nothing: `server/backendAddress.js` depends on the coercers here, and
  * that module is reachable from `vite.config.js`.
@@ -73,6 +74,22 @@ export function coerceBoundedInt(name, raw, bounds) {
   return value;
 }
 
+/**
+ * Coerce a non-empty, whitespace-free string.
+ *
+ * A value that is present but blank is treated as unset by the caller, matching
+ * the `.trim()` the legacy proxies applied; this only runs on a real value.
+ *
+ * @param {string} name - Variable name, for the error message.
+ * @param {unknown} raw - Raw value.
+ * @returns {string} Trimmed value.
+ */
+export function coerceNonEmptyString(name, raw) {
+  const value = String(raw).trim();
+  if (!value) throw new ConfigProblem(name, 'must not be empty');
+  return value;
+}
+
 /** Coerce a non-empty host string. */
 export function coerceHost(name, raw) {
   const value = String(raw).trim();
@@ -86,9 +103,13 @@ export function coerceHost(name, raw) {
 /**
  * The PANOPTIC-owned variables.
  *
- * `scope: 'server'` on all three — none of these reach the browser. The field
+ * `scope: 'server'` on every one — none of these reach the browser. The field
  * exists so the client/server boundary is declared rather than implied, and so
  * a future client-scoped entry is a deliberate act.
+ *
+ * `owner` and `property` are what build a collector's config slice: an entry
+ * owned by `firms` becomes `config.collectors.firms.mapKey`, wrapped in
+ * `secret()` when `secret: true`.
  *
  * @type {readonly {name: string, owner: string, scope: string, secret: boolean, default: unknown, coerce: Function}[]}
  */
@@ -96,6 +117,7 @@ export const PANOPTIC_SCHEMA = Object.freeze([
   Object.freeze({
     name: 'PANOPTIC_HOST',
     owner: 'server',
+    property: 'host',
     scope: 'server',
     secret: false,
     default: DEFAULT_HOST,
@@ -105,6 +127,7 @@ export const PANOPTIC_SCHEMA = Object.freeze([
   Object.freeze({
     name: 'PANOPTIC_PORT',
     owner: 'server',
+    property: 'port',
     scope: 'server',
     secret: false,
     default: DEFAULT_PORT,
@@ -113,8 +136,22 @@ export const PANOPTIC_SCHEMA = Object.freeze([
     coerce: (name, raw) => coerceBoundedInt(name, raw, { min: 0, max: 65_535 }),
   }),
   Object.freeze({
+    // Migrated out of vite.config.js with the FIRMS collector. Optional: its
+    // absence is a DEGRADED collector, never a startup failure — a keyless
+    // fires layer is a specified product state, not a misconfiguration.
+    name: 'FIRMS_MAP_KEY',
+    owner: 'firms',
+    property: 'mapKey',
+    scope: 'server',
+    secret: true,
+    default: null,
+    describe: 'NASA FIRMS MAP_KEY for live active-fire detections.',
+    coerce: (name, raw) => coerceNonEmptyString(name, raw),
+  }),
+  Object.freeze({
     name: 'PANOPTIC_SHUTDOWN_TIMEOUT_MS',
     owner: 'server',
+    property: 'shutdownTimeoutMs',
     scope: 'server',
     secret: false,
     default: DEFAULT_SHUTDOWN_TIMEOUT_MS,
@@ -134,6 +171,7 @@ export const PANOPTIC_SCHEMA = Object.freeze([
  */
 export const COLLECTOR_REQUIREMENTS = Object.freeze({
   celestrak: Object.freeze([]),
+  firms: Object.freeze(['FIRMS_MAP_KEY']),
 });
 
 /**

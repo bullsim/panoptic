@@ -44,9 +44,8 @@ const SECRET_BRAND = Symbol('panoptic.secret');
  * `String()`, `JSON.stringify()` and `util.inspect()` return `[redacted]`, and
  * reading the value requires saying `.reveal()` on purpose.
  *
- * No PANOPTIC-owned variable is secret today. This exists ready for the FIRMS
- * migration, and is proven by tests with synthetic values rather than by
- * inventing a credential we do not yet own.
+ * `FIRMS_MAP_KEY` is the first secret PANOPTIC owns. Its collector unwraps it at
+ * exactly one place — the NASA URL builder — and nowhere else.
  *
  * @param {string} value - The sensitive value.
  * @returns {{reveal: () => string}} An opaque box.
@@ -137,7 +136,17 @@ export function loadPanopticConfig({
 
   const collectors = {};
   for (const id of Object.keys(COLLECTOR_REQUIREMENTS)) {
-    collectors[id] = Object.freeze({ configuration: collectorConfigurationState(id, values) });
+    // A collector gets ONLY its own values, keyed by the schema's `property`,
+    // with secrets boxed. Nothing hands it the whole tree or process.env.
+    const slice = { configuration: collectorConfigurationState(id, values) };
+    for (const entry of PANOPTIC_SCHEMA) {
+      if (entry.owner !== id || !entry.property) continue;
+      const value = values[entry.name];
+      slice[entry.property] = entry.secret && value !== null && value !== undefined
+        ? secret(value)
+        : value ?? null;
+    }
+    collectors[id] = Object.freeze(slice);
   }
 
   return Object.freeze({

@@ -19,11 +19,12 @@
  */
 
 import celestrak from './collectors/celestrak.js';
+import firms from './collectors/firms.js';
 import { createRuntime } from './runtime/registry.js';
 import { resolveBackendAddress } from './backendAddress.js';
 
 /** Collectors migrated out of `vite.config.js` so far. */
-export const COLLECTORS = Object.freeze([celestrak]);
+export const COLLECTORS = Object.freeze([celestrak, firms]);
 
 /**
  * Vite plugins mounting every migrated collector.

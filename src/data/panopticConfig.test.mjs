@@ -53,16 +53,17 @@ const load = (dir, processEnv = {}, extra = {}) =>
 
 test('the schema declares only PANOPTIC-owned variables', () => {
   assert.deepEqual(
-    PANOPTIC_SCHEMA.map((e) => e.name),
-    ['PANOPTIC_HOST', 'PANOPTIC_PORT', 'PANOPTIC_SHUTDOWN_TIMEOUT_MS'],
+    [...PANOPTIC_SCHEMA.map((e) => e.name)].sort(),
+    ['FIRMS_MAP_KEY', 'PANOPTIC_HOST', 'PANOPTIC_PORT', 'PANOPTIC_SHUTDOWN_TIMEOUT_MS'],
   );
-  // Legacy variables still read by vite.config.js must NOT appear: modelling
-  // them here would give one value two owners.
+  // FIRMS_MAP_KEY entered the schema in the same commit that moved the FIRMS
+  // collector into server/. Everything below is STILL read by vite.config.js
+  // and must not appear here — modelling it would give one value two owners.
   const names = new Set(PANOPTIC_SCHEMA.map((e) => e.name));
   for (const legacy of [
-    'FIRMS_MAP_KEY', 'TOMTOM_API_KEY', 'OPENAI_API_KEY', 'AISSTREAM_API_KEY',
+    'TOMTOM_API_KEY', 'OPENAI_API_KEY', 'AISSTREAM_API_KEY',
     'OPENSKY_CLIENT_ID', 'OPENSKY_CREDENTIALS_FILE', 'GOOGLE_MAPS_API_KEY',
-    'CESIUM_ION_TOKEN', 'HOST', 'PORT',
+    'CESIUM_ION_TOKEN', 'LL2_API_TOKEN', 'TFL_APP_KEY', 'HOST', 'PORT',
   ]) {
     assert.equal(names.has(legacy), false, `${legacy} is still Vite-owned and must not be in the schema`);
   }
@@ -78,6 +79,41 @@ test('CelesTrak requires no configuration', async () => {
   try {
     const config = load(dir);
     assert.deepEqual(config.collectors.celestrak, { configuration: 'not-required' });
+  } finally { await cleanup(); }
+});
+
+test('FIRMS receives its own slice, with the key boxed', async () => {
+  assert.deepEqual([...COLLECTOR_REQUIREMENTS.firms], ['FIRMS_MAP_KEY']);
+  const { dir, cleanup } = await envDir();
+  const KEY = 'SYNTHETIC-CONFIG-KEY-4242';
+  try {
+    const keyed = load(dir, { FIRMS_MAP_KEY: KEY });
+    assert.equal(keyed.collectors.firms.configuration, 'configured');
+    assert.equal(isSecret(keyed.collectors.firms.mapKey), true, 'a secret must arrive boxed');
+    assert.equal(keyed.collectors.firms.mapKey.reveal(), KEY);
+    // The whole config must not render the value, by any route.
+    for (const rendering of [JSON.stringify(keyed), inspect(keyed, { depth: 8 }), String(keyed.collectors.firms.mapKey)]) {
+      assert.equal(rendering.includes(KEY), false, 'the key must never render');
+    }
+    // And CelesTrak gets nothing of it.
+    assert.deepEqual(keyed.collectors.celestrak, { configuration: 'not-required' });
+
+    const keyless = load(dir, {});
+    assert.deepEqual(keyless.collectors.firms, { configuration: 'missing', mapKey: null });
+
+    // Whitespace-only is treated as absent, matching the legacy .trim().
+    assert.deepEqual(load(dir, { FIRMS_MAP_KEY: '   ' }).collectors.firms,
+      { configuration: 'missing', mapKey: null });
+  } finally { await cleanup(); }
+});
+
+test('a missing FIRMS key degrades the collector, it never fails startup', async () => {
+  const { dir, cleanup } = await envDir();
+  try {
+    // The whole point of the DEGRADED class: the server still comes up.
+    const config = load(dir, {});
+    assert.equal(config.collectors.firms.configuration, 'missing');
+    assert.equal(config.server.port, 8787, 'startup configuration is unaffected');
   } finally { await cleanup(); }
 });
 
@@ -264,6 +300,8 @@ test('defaults apply when nothing is configured', () => {
   assert.deepEqual(values, {
     PANOPTIC_HOST: '127.0.0.1',
     PANOPTIC_PORT: 8787,
+    // Optional secret: absent is a default of null, never a startup failure.
+    FIRMS_MAP_KEY: null,
     PANOPTIC_SHUTDOWN_TIMEOUT_MS: 10_000,
   });
 });

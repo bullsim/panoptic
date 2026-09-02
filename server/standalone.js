@@ -40,7 +40,7 @@ export function createStandaloneServer({
   now = () => Date.now(),
   log = console,
 } = {}) {
-  const runtime = createRuntime(collectors);
+  const runtime = createRuntime(collectors, { config });
   // Configuration STATE only — an enum per collector, never a value. CelesTrak
   // needs no configuration at all, which reports as 'not-required'.
   const routes = runtime.routes(SURFACE).map((route) => ({

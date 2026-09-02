@@ -25,6 +25,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import celestrak from '../../server/collectors/celestrak.js';
 import { createStandaloneServer, HEALTH_ROUTE, SURFACE } from '../../server/standalone.js';
+import { COLLECTORS } from '../../server/index.js';
 import { createRuntime, defineCollector, routeRemainder } from '../../server/runtime/registry.js';
 import { installShutdown } from '../../server/bin/serve.js';
 
@@ -298,6 +299,33 @@ test('health reports a live backend and what it serves', async () => {
       assert.equal(rendered.toLowerCase().includes(forbidden.toLowerCase()), false, `health leaked ${forbidden}`);
     }
   } finally { await server.close(); await cleanup(); }
+});
+
+test('health reports each collector configuration state and degrades when one is missing', async () => {
+  const KEY = 'SYNTHETIC-HEALTH-KEY-9182';
+  const cases = [
+    [{ firms: { configuration: 'configured', mapKey: { reveal: () => KEY, toJSON: () => '[redacted]' } } }, 'ok', 'configured'],
+    [{ firms: { configuration: 'missing', mapKey: null } }, 'degraded', 'missing'],
+  ];
+  for (const [collectorsConfig, expectedStatus, expectedConfiguration] of cases) {
+    const config = { collectors: { celestrak: { configuration: 'not-required' }, ...collectorsConfig } };
+    const { server } = createStandaloneServer({ collectors: COLLECTORS, config, log: silent });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const res = await fetch(`http://127.0.0.1:${server.address().port}/health`);
+      const body = await res.json();
+      assert.equal(body.status, expectedStatus);
+      const byId = Object.fromEntries(body.collectors.map((c) => [c.id, c.configuration]));
+      assert.equal(byId.celestrak, 'not-required');
+      assert.equal(byId.firms, expectedConfiguration);
+      // The key never appears, under any name.
+      assert.equal(JSON.stringify(body).includes(KEY), false, 'health must never carry a secret');
+      assert.equal(JSON.stringify(body).includes('mapKey'), false);
+      assert.equal(JSON.stringify(body).includes('FIRMS_MAP_KEY'), false);
+    } finally {
+      await new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); });
+    }
+  }
 });
 
 test('an unrouted path is a plain 404', async () => {
