@@ -37,7 +37,9 @@
  */
 
 import path from 'node:path';
-import { filterTrailing24h, parseFirmsCsv } from '../../src/data/firmsCsv.js';
+import { acquisitionMsUtc, filterTrailing24h, parseFirmsCsv } from '../../src/data/firmsCsv.js';
+import { BATCH_SCHEMA } from '../contracts/observation/v1.js';
+import { deriveObservationId } from '../contracts/observation/identity.js';
 import { createTtlCache } from '../runtime/cache.js';
 import { defineCollector } from '../runtime/registry.js';
 import { sendJson } from '../runtime/http.js';
@@ -320,4 +322,75 @@ function transactions(ctx, mapKey) {
       .finally(() => { memo.inflight = null; });
   }
   return memo.inflight;
+}
+
+// ---------------------------------------------------------------------------
+// Observation v1 normaliser
+// ---------------------------------------------------------------------------
+// PURE and DELIBERATELY UNWIRED. The handler above must never call this: a
+// global batch is ~311k detections, and normalising them inside a request would
+// add work to a path that serves cached responses in 0.65 s. It exists so the
+// contract is exercised against real data, and it will be wired when a consumer
+// exists. It does not mutate the cache entry it is given.
+
+/**
+ * Convert a FIRMS cache entry into an Observation v1 batch.
+ *
+ * FIRMS issues no record identifier, so `sourceRecordId` is OMITTED and identity
+ * comes from the type's declared content key — formalising the
+ * `firms:{lat}:{lon}:{acqMs}:{satellite}` identity the browser layer already
+ * synthesises.
+ *
+ * `confidence` stays in `properties` verbatim (`l`/`n`/`h`). It grades the
+ * SENSOR DETECTION, not a classification, and promoting it to a canonical
+ * quality field would make one domain's concept look universal.
+ *
+ * @param {{at: number, sources: object[], fires: object[]}} entry - Cache entry.
+ * @param {object} [options] - Options.
+ * @param {string} [options.feed] - Source feed; FIRMS merges three VIIRS sources,
+ *   so the per-record `satellite`/`instrument` stay in properties.
+ * @returns {object} A `panoptic.observationBatch.v1` batch.
+ */
+export function toObservations(entry, { feed = null } = {}) {
+  const source = feed ? { id: 'firms', feed } : { id: 'firms' };
+  const ingestedAt = Number(entry?.at);
+  const observations = [];
+
+  for (const fire of entry?.fires ?? []) {
+    const lon = Number(fire?.lon);
+    const lat = Number(fire?.lat);
+    const observedAt = acquisitionMsUtc(fire?.acqDate, fire?.acqTime);
+    if (!Number.isFinite(lon) || !Number.isFinite(lat) || !Number.isFinite(observedAt)) continue;
+
+    const observation = {
+      observationType: 'environment.fire_detection',
+      observedAt,
+      geometry: { type: 'Point', coordinates: [lon, lat] },
+      properties: {
+        frp: fire.frp,
+        brightness: fire.brightness,
+        brightnessTi5: fire.brightnessTi5,
+        // Source-native detection confidence, verbatim: 'l' | 'n' | 'h', or a
+        // numeric percentage on some FIRMS products.
+        confidence: fire.confidence,
+        daynight: fire.daynight,
+        satellite: fire.satellite,
+        instrument: fire.instrument,
+      },
+    };
+    observation.observationId = deriveObservationId(observation, source);
+    observations.push(observation);
+  }
+
+  return {
+    schema: BATCH_SCHEMA,
+    source,
+    observationType: 'environment.fire_detection',
+    ingestedAt,
+    derivation: [
+      { method: 'source_reported', by: 'nasa.firms' },
+      { method: 'ingested', by: 'panoptic.collector.firms', at: ingestedAt },
+    ],
+    observations,
+  };
 }
