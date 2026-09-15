@@ -23,6 +23,7 @@ import {
   GEOMETRY_POLICY,
   OBSERVATION_TYPES,
   effectiveDerivation,
+  temporalSemantics,
   geometryPolicy,
   supersedesAt,
 } from '../../server/contracts/observation/v1.js';
@@ -68,6 +69,55 @@ test('every registered type declares one of the three geometry policies', () => 
     assert.ok(states.has(spec.geometry), `${type} has an unknown geometry policy`);
     assert.ok(Array.isArray(spec.revisionKey), `${type} must declare a revisionKey`);
   }
+});
+
+test('every registered type declares its temporal semantics', () => {
+  for (const [type, spec] of Object.entries(OBSERVATION_TYPES)) {
+    assert.ok(
+      spec.temporalSemantics === 'state' || spec.temporalSemantics === 'occurrence',
+      `${type} must declare 'state' or 'occurrence' temporal semantics`,
+    );
+    assert.equal(temporalSemantics(type), spec.temporalSemantics);
+  }
+  assert.equal(temporalSemantics('not.a.type'), null);
+});
+
+test('temporal semantics match the approved ruling', () => {
+  // A `state` type asserts the condition of a record at an instant, so "what
+  // was in force at T?" is meaningful. An `occurrence` asserts only that
+  // something happened — there is no persistent subject, so the Evidence Store
+  // refuses the question rather than answering [] and looking like "nothing".
+  assert.equal(temporalSemantics('air.position'), 'state');
+  assert.equal(temporalSemantics('sea.position'), 'state');
+  assert.equal(temporalSemantics('ground.seismic_solution'), 'state');
+  assert.equal(temporalSemantics('space.orbital_elements'), 'state');
+  assert.equal(temporalSemantics('environment.fire_detection'), 'occurrence');
+});
+
+test('temporal semantics are METADATA and never touch identity', () => {
+  // The golden vectors above already pin the ids byte-for-byte, so an accidental
+  // inclusion would fail there too. This states the rule directly: an identity
+  // input must be declared in a revisionKey or contentKey, and neither may name
+  // temporalSemantics. Adding classification metadata to a type must never
+  // orphan every id previously derived for it.
+  for (const [type, spec] of Object.entries(OBSERVATION_TYPES)) {
+    const declared = [...(spec.revisionKey ?? []), ...(spec.contentKey ?? [])];
+    assert.equal(
+      declared.some((field) => field.path.includes('temporalSemantics')),
+      false,
+      `${type} must not derive identity from temporalSemantics`,
+    );
+  }
+  const observation = {
+    observationType: 'ground.seismic_solution',
+    observedAt: 1788370000000,
+    sourceRecordId: 'nc73912345',
+    geometry: { type: 'Point', coordinates: [-122.8, 38.8] },
+    properties: { magnitude: 4.2, depthM: 8200 },
+  };
+  const canonical = canonicalIdentityString(observation, { id: 'usgs' });
+  assert.equal(canonical.includes('state'), false);
+  assert.equal(canonical.includes('occurrence'), false);
 });
 
 test('geometry policies match the approved ruling', () => {

@@ -66,6 +66,14 @@ export const DERIVATION_METHODS = Object.freeze([
  *                  record, so identity reduces to source + record + time.
  *   contentKey   — ORDERED allowlist used INSTEAD of sourceRecordId when the
  *                  source issues no identifier of its own (FIRMS).
+ *   temporalSemantics — 'state' when an observation asserts the condition of an
+ *                  identified record at an instant (a position, an orbit, a
+ *                  seismic solution), so "what was in force at time T" is
+ *                  meaningful. 'occurrence' when it asserts only that something
+ *                  happened at a place and time, with no persistent subject (a
+ *                  fire detection). METADATA ABOUT THE TYPE — it never
+ *                  participates in observationId, canonicalIdentityString,
+ *                  revisionKey, contentKey or lineageKey.
  *
  * `decimals` fixes numeric formatting so 4.2 and 4.20 cannot yield different
  * ids, and so float noise never ripples into identity. Never hash arbitrary
@@ -75,17 +83,20 @@ export const DERIVATION_METHODS = Object.freeze([
  */
 export const OBSERVATION_TYPES = Object.freeze({
   'air.position': Object.freeze({
+    temporalSemantics: 'state',
     geometry: GEOMETRY_POLICY.REQUIRED,
     // A position report is a point-in-time statement; sources do not revise it.
     revisionKey: Object.freeze([]),
   }),
 
   'sea.position': Object.freeze({
+    temporalSemantics: 'state',
     geometry: GEOMETRY_POLICY.REQUIRED,
     revisionKey: Object.freeze([]),
   }),
 
   'environment.fire_detection': Object.freeze({
+    temporalSemantics: 'occurrence',
     geometry: GEOMETRY_POLICY.REQUIRED,
     // FIRMS never revises a detection — it is an immutable sensor event.
     revisionKey: Object.freeze([]),
@@ -101,6 +112,7 @@ export const OBSERVATION_TYPES = Object.freeze({
   }),
 
   'ground.seismic_solution': Object.freeze({
+    temporalSemantics: 'state',
     geometry: GEOMETRY_POLICY.REQUIRED,
     // A seismic SOLUTION is an estimate, and USGS revises magnitude and depth
     // in the hours after an event. Same event id, same event time, new numbers
@@ -114,6 +126,7 @@ export const OBSERVATION_TYPES = Object.freeze({
   }),
 
   'space.orbital_elements': Object.freeze({
+    temporalSemantics: 'state',
     // PROHIBITED: an element set describes an orbit, not a place. A position
     // only exists once a caller supplies `calculatedFor` and propagates.
     geometry: GEOMETRY_POLICY.PROHIBITED,
@@ -141,6 +154,21 @@ export function isKnownObservationType(type) {
 /** Geometry policy for a type, or `null` when the type is unknown. */
 export function geometryPolicy(type) {
   return OBSERVATION_TYPES[type]?.geometry ?? null;
+}
+
+/**
+ * Temporal semantics for a type, or `null` when the type is unknown.
+ *
+ * `state` types support "what was in force at time T"; `occurrence` types do
+ * not, because there is no persistent subject whose condition could be in
+ * force. Asking a state question of an occurrence type is a category error, and
+ * the Evidence Store rejects it rather than answering with an empty set.
+ *
+ * @param {string} type - Observation type.
+ * @returns {'state'|'occurrence'|null} Semantics.
+ */
+export function temporalSemantics(type) {
+  return OBSERVATION_TYPES[type]?.temporalSemantics ?? null;
 }
 
 /**
