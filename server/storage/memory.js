@@ -8,6 +8,10 @@
  * the shared conformance suite in `src/data/observationStoreConformance.mjs`.
  * Any later backing store must pass that same suite unchanged.
  *
+ * The RULES live in `./semantics.js`, shared with every other adapter; this file
+ * is the indexes over them. That split is deliberate: a database adapter must be
+ * a different place to put rows, never a different set of rules.
+ *
  * Correctness first, deliberately. Grouping is by Map and ordering is per query,
  * because a reference implementation that is fast but subtly wrong teaches the
  * wrong semantics to everything built on it.
@@ -15,6 +19,9 @@
  * ---------------------------------------------------------------------------
  * WHAT THE STORE PROMISES
  * ---------------------------------------------------------------------------
+ *
+ *   ATOMIC        A batch is prepared and validated in full before anything is
+ *                 applied. One unacceptable observation stores none of them.
  *
  *   IDEMPOTENT    Re-inserting an observation with an id already held is a
  *                 no-op. In particular it does NOT move KNOWLEDGE TIME: the
@@ -30,6 +37,10 @@
  *   WHOLE         The full observation is retained. Positions are not thinned,
  *                 summarised or down-sampled on the way in; deciding what is
  *                 interesting is not a storage decision.
+ *
+ * The public surface is AWAITABLE. These methods happen to return their values
+ * synchronously, which is what a Map can do; a database adapter returns
+ * promises. Callers await either way, so one conformance suite tests both.
  *
  * ---------------------------------------------------------------------------
  * WHY THERE IS NO SINGLE `stateAt`
@@ -53,77 +64,30 @@
  * @module server/storage/memory
  */
 
-import { effectiveDerivation } from '../contracts/observation/v1.js';
+import { ELEMENT_SET_MODES, isStateful, withinWindow } from './contract.js';
 import {
-  ELEMENT_SET_MODES,
-  assertStateful,
-  candidateKeyTokens,
-  isStateful,
-  recordKey as buildRecordKey,
-  recordKeyOf,
-  stateKeyOf,
-  withinWindow,
-} from './contract.js';
-
-/**
- * Freeze an observation and everything inside it.
- *
- * The store promises stored evidence never changes. A top-level freeze would
- * not deliver that — `row.observation.properties.magnitude = 9` would still
- * succeed — and silent mutation of held evidence is exactly the failure an
- * evidence store exists to prevent.
- */
-function deepFreeze(value) {
-  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
-  Object.freeze(value);
-  for (const inner of Object.values(value)) deepFreeze(inner);
-  return value;
-}
+  EMPTY_ENTITY_HISTORY,
+  assembleEntityHistory,
+  assertObservationId,
+  buildElementSetResult,
+  byEventTime,
+  byKnowledge,
+  collapseRevisions,
+  compareText,
+  prepareBatch,
+  prepareElementSetQuery,
+  prepareEntityHistoryQuery,
+  prepareObservationsBetweenQuery,
+  prepareRecordHistoryQuery,
+  prepareRevisionsOfQuery,
+  prepareStatesAtQuery,
+} from './semantics.js';
 
 /** Append `value` to the array at `key`, creating it on first use. */
 function push(index, key, value) {
   const bucket = index.get(key);
   if (bucket) bucket.push(value);
   else index.set(key, [value]);
-}
-
-/** Deterministic string order. */
-function compareText(a, b) {
-  if (a < b) return -1;
-  return a > b ? 1 : 0;
-}
-
-/**
- * Order two versions of one STATE by knowledge.
- *
- * Later KNOWLEDGE TIME wins — that is the revision order. When two revisions
- * were ingested in the same millisecond the store still has to answer, so it
- * falls back to the observation id: arbitrary, but stable across runs, hosts
- * and backing stores, which is the property that actually matters. A tie here
- * means two versions arrived in one batch, and the store cannot know which the
- * source considered later.
- */
-function byKnowledge(a, b) {
-  if (a.ingestedAt !== b.ingestedAt) return a.ingestedAt - b.ingestedAt;
-  return compareText(a.observationId, b.observationId);
-}
-
-/** Order by EVENT TIME, then by knowledge. Oldest first. */
-function byEventTime(a, b) {
-  if (a.observedAt !== b.observedAt) return a.observedAt - b.observedAt;
-  return byKnowledge(a, b);
-}
-
-/** Resolve a record selector to a RECORD KEY. */
-function selectorToRecordKey(selector) {
-  if (typeof selector === 'string') return selector;
-  if (selector?.recordKey) return selector.recordKey;
-  return buildRecordKey({
-    sourceId: selector?.sourceId ?? selector?.source?.id,
-    feed: selector?.feed ?? selector?.source?.feed,
-    observationType: selector?.observationType,
-    sourceRecordId: selector?.sourceRecordId,
-  });
 }
 
 /**
@@ -144,91 +108,31 @@ export function createMemoryObservationStore() {
   const byCandidateKey = new Map();
 
   /**
-   * Freeze one observation into a stored row.
+   * Insert a batch. Atomic, and idempotent per observation id.
    *
-   * Batch constants are RESOLVED here rather than kept as a reference to the
-   * batch: an observation must remain interpretable on its own, and a store
-   * that needed its batch alongside it to answer a question would have made the
-   * batch part of the data model.
-   *
-   * THE STORE DOES NOT MINT IDENTITY. An observation arrives canonical:
-   *
-   *   SOURCE -> NORMALISER -> valid Observation v1 -> EVIDENCE STORE
-   *
-   * A missing `observationId` is REJECTED, never derived. Deriving one here
-   * would put a second implementation of identity behind the storage boundary,
-   * and the failure mode is silent: a normaliser bug that dropped ids would be
-   * papered over, and the store's ids could drift from the collector's without
-   * anything failing. The store owns persistence semantics; the contract owns
-   * identity.
-   *
-   * The observation is COPIED, not referenced. A caller that reuses or mutates
-   * its own array after insertion must not be able to change what the store
-   * holds — and any real backing store serialises on the way in, so copying
-   * here makes the reference implementation honest about the same semantics.
-   * The copy costs; correctness is what this implementation is for, and Slice B
-   * is where the cost is engineered away.
-   */
-  function toRow(batch, observation) {
-    const source = batch.source;
-    const observationType = observation.observationType ?? batch.observationType;
-    const observationId = observation.observationId;
-    if (typeof observationId !== 'string' || observationId === '') {
-      throw new TypeError(
-        'observation.observationId is required: the Evidence Store stores canonical '
-        + 'Observation v1 records and never derives identity. Normalise before inserting.',
-      );
-    }
-    const resolved = deepFreeze(structuredClone({
-      ...observation,
-      observationType,
-      derivation: effectiveDerivation(batch, observation),
-    }));
-
-    return Object.freeze({
-      observationId,
-      observationType,
-      source: Object.freeze({ id: source?.id, feed: source?.feed ?? null }),
-      sourceRecordId: observation.sourceRecordId,
-      // EVENT TIME — when the source says this was true.
-      observedAt: observation.observedAt,
-      // KNOWLEDGE TIME — when PANOPTIC first possessed it. Never updated.
-      ingestedAt: batch.ingestedAt,
-      recordKey: recordKeyOf(resolved, source),
-      stateKey: stateKeyOf(resolved, source),
-      candidateKeys: Object.freeze(candidateKeyTokens(observation.entityRef?.keys)),
-      observation: resolved,
-    });
-  }
-
-  /**
-   * Insert a batch. Idempotent per observation id.
+   * `prepareBatch` validates and builds every row first, so nothing below runs
+   * unless the whole batch is acceptable. That matches a database transaction,
+   * and it is the only way a caller can retry a rejected batch without wondering
+   * which half of it landed.
    *
    * @param {object} batch - A `panoptic.observationBatch.v1` batch.
    * @returns {{inserted: number, duplicates: number, observationIds: string[]}} Result.
    */
   function insertBatch(batch) {
-    if (!batch || typeof batch !== 'object') throw new TypeError('insertBatch requires a batch object');
-    if (!batch.source?.id) throw new TypeError('batch.source.id is required');
-    if (!Number.isFinite(batch.ingestedAt)) {
-      throw new TypeError('batch.ingestedAt (KNOWLEDGE TIME) must be epoch ms');
-    }
-    if (!Array.isArray(batch.observations)) throw new TypeError('batch.observations must be an array');
+    const { rows, observationIds } = prepareBatch(batch);
 
-    const observationIds = [];
     let inserted = 0;
-    let duplicates = 0;
-
-    for (const observation of batch.observations) {
-      const row = toRow(batch, observation);
-      observationIds.push(row.observationId);
-
+    for (const row of rows) {
       // DUPLICATE: already known. No-op — and specifically no touch of
       // ingestedAt, so re-delivery cannot rewrite when we learned this.
-      if (byId.has(row.observationId)) {
-        duplicates += 1;
-        continue;
-      }
+      //
+      // The id is the idempotency key, full stop. If two observations ever share
+      // an id but differ materially, that is an INTEGRITY ANOMALY in whatever
+      // produced them — identity is content-addressed, so it should be
+      // impossible — and it is emphatically NOT a way to revise evidence. A real
+      // revision changes identity-bearing content and therefore gets its own id.
+      // Detecting and reporting such an anomaly is deliberately not done here.
+      if (byId.has(row.observationId)) continue;
 
       byId.set(row.observationId, row);
       push(byType, row.observationType, row);
@@ -240,48 +144,18 @@ export function createMemoryObservationStore() {
       inserted += 1;
     }
 
-    return { inserted, duplicates, observationIds };
+    return { inserted, duplicates: observationIds.length - inserted, observationIds };
   }
 
-  /** Rows of a type, or every row when no type is given. */
+  /** Rows of a type, or every row when the filter is absent. */
   function rowsOfType(observationType) {
-    if (observationType === undefined || observationType === null) return [...byId.values()];
+    if (observationType === undefined) return [...byId.values()];
     return byType.get(observationType) ?? [];
   }
 
   /** Whether a row was known by `knowledgeTime` (always true when unset). */
   function known(row, knowledgeTime) {
     return knowledgeTime === undefined || knowledgeTime === null || row.ingestedAt <= knowledgeTime;
-  }
-
-  /**
-   * Reduce each STATE to its single version in force.
-   *
-   * Without this, a source that revised one earthquake would appear in a track
-   * as two events, and a caller counting rows would count PANOPTIC's changes of
-   * mind as things that happened in the world. Callers who want the versions
-   * ask `revisionsOf`, which is the audit primitive and never collapses.
-   *
-   * Rows with no STATE KEY pass through untouched: with no record identity
-   * there is nothing to collapse them against, and merging them would fabricate
-   * a lineage the source never asserted.
-   *
-   * Filtering by KNOWLEDGE TIME must happen BEFORE this, so the surviving
-   * version is the latest one visible at that time rather than the latest one
-   * that ever existed.
-   */
-  function collapseRevisions(rows) {
-    const winners = new Map();
-    const unkeyed = [];
-    for (const row of rows) {
-      if (row.stateKey === null) {
-        unkeyed.push(row);
-        continue;
-      }
-      const best = winners.get(row.stateKey);
-      if (best === undefined || byKnowledge(best, row) < 0) winners.set(row.stateKey, row);
-    }
-    return [...winners.values(), ...unkeyed];
   }
 
   /**
@@ -297,10 +171,12 @@ export function createMemoryObservationStore() {
    * @param {number} [query.to] - Window end, EXCLUSIVE.
    * @param {number} [query.knowledgeTime] - As known at this time.
    * @param {string} [query.sourceId] - Restrict to one source.
-   * @param {string} [query.feed] - Restrict to one feed of that source.
+   * @param {string|null} [query.feed] - One feed, or null for sources with none.
    * @returns {object[]} Rows, oldest EVENT TIME first.
    */
-  function observationsBetween({ observationType, from, to, knowledgeTime, sourceId, feed } = {}) {
+  function observationsBetween(query = {}) {
+    const { observationType, from, to, knowledgeTime, sourceId, feed } = prepareObservationsBetweenQuery(query);
+
     return rowsOfType(observationType)
       .filter((row) => withinWindow(row.observedAt, from, to)
         && known(row, knowledgeTime)
@@ -342,9 +218,8 @@ export function createMemoryObservationStore() {
    * @throws {UnsupportedTemporalSemantics} For an `occurrence` type.
    * @throws {UnknownObservationType} For an unregistered type.
    */
-  function statesAt({ observationType, eventTime, knowledgeTime, sourceId, feed } = {}) {
-    assertStateful(observationType, 'statesAt');
-    if (!Number.isFinite(eventTime)) throw new TypeError('statesAt requires a finite eventTime');
+  function statesAt(query = {}) {
+    const { observationType, eventTime, knowledgeTime, sourceId, feed } = prepareStatesAtQuery(query);
 
     const visible = rowsOfType(observationType).filter((row) => row.recordKey !== null
       && row.observedAt <= eventTime
@@ -385,9 +260,9 @@ export function createMemoryObservationStore() {
    * @param {object} [window] - Optional `{from, to, knowledgeTime}`.
    * @returns {object[]} States, oldest EVENT TIME first.
    */
-  function recordHistory(selector, { from, to, knowledgeTime } = {}) {
-    const key = selectorToRecordKey(selector);
-    const visible = (byRecord.get(key) ?? [])
+  function recordHistory(selector, window = {}) {
+    const { recordKey, from, to, knowledgeTime } = prepareRecordHistoryQuery(selector, window);
+    const visible = (byRecord.get(recordKey) ?? [])
       .filter((row) => withinWindow(row.observedAt, from, to) && known(row, knowledgeTime));
     return collapseRevisions(visible).sort(byEventTime);
   }
@@ -402,23 +277,9 @@ export function createMemoryObservationStore() {
    * @param {object} [options] - Optional `{knowledgeTime}`.
    * @returns {object[]} Rows in revision order.
    */
-  function revisionsOf(selector, { knowledgeTime } = {}) {
-    let key;
-    if (typeof selector === 'string') {
-      key = selector;
-    } else if (selector?.stateKey) {
-      key = selector.stateKey;
-    } else {
-      key = stateKeyOf(
-        {
-          observationType: selector?.observationType,
-          sourceRecordId: selector?.sourceRecordId,
-          observedAt: selector?.observedAt,
-        },
-        { id: selector?.sourceId ?? selector?.source?.id, feed: selector?.feed ?? selector?.source?.feed },
-      );
-    }
-    return (byState.get(key) ?? [])
+  function revisionsOf(selector, options = {}) {
+    const { stateKey, knowledgeTime } = prepareRevisionsOfQuery(selector, options);
+    return (byState.get(stateKey) ?? [])
       .filter((row) => known(row, knowledgeTime))
       .sort(byKnowledge);
   }
@@ -426,19 +287,10 @@ export function createMemoryObservationStore() {
   /**
    * Everything matching a candidate key, ACROSS sources.
    *
-   * A CANDIDATE-KEY MATCH IS NOT AN IDENTITY. It says two observations carry the
-   * same identifier — nothing more. `icao24` addresses are reassigned, `mmsi` is
-   * routinely spoofed, and no entity resolution exists in PANOPTIC. Every row is
-   * therefore marked `candidateKeyMatch: true` and carries `matchedOn`, so a
-   * caller can never mistake the join for a resolved entity.
-   *
    * A query key set matches a row when they share AT LEAST ONE recognised key:
    * `{icao24}` matches a row holding `{icao24, registration}`. Unrecognised
    * namespaces are ignored rather than compared, so an arbitrary field cannot
    * become a way to join unrelated evidence.
-   *
-   * Revisions are RESOLVED here. A source changing its mind about one instant
-   * must not read as the craft having been in two places.
    *
    * @param {object} query - Query.
    * @param {object} query.keys - Candidate keys, e.g. `{icao24: 'abc123'}`.
@@ -448,14 +300,8 @@ export function createMemoryObservationStore() {
    * @param {number} [query.knowledgeTime] - As known at this time.
    * @returns {{candidateKeyMatch: true, matchedOn: string[], observations: object[]}} Result.
    */
-  function entityHistory({ keys, observationType, from, to, knowledgeTime } = {}) {
-    const tokens = candidateKeyTokens(keys);
-    const empty = Object.freeze({
-      candidateKeyMatch: true,
-      matchedOn: Object.freeze([]),
-      observations: Object.freeze([]),
-    });
-    if (tokens.length === 0) return empty;
+  function matchTokens(tokens, { observationType, from, to, knowledgeTime }) {
+    if (tokens.length === 0) return EMPTY_ENTITY_HISTORY;
 
     // Union over tokens, de-duplicated by observation id: a row matching on both
     // noradId and intlDesignator is one row, matched twice.
@@ -470,20 +316,12 @@ export function createMemoryObservationStore() {
       }
     }
 
-    const observations = collapseRevisions([...matched.values()].map(({ row }) => row))
-      .sort(byEventTime)
-      .map((row) => Object.freeze({
-        ...row,
-        matchedOn: Object.freeze([...matched.get(row.observationId).matchedOn].sort()),
-      }));
+    return assembleEntityHistory(matched.values());
+  }
 
-    return Object.freeze({
-      // NOT a resolved identity. These observations share an identifier, and
-      // nothing here claims they describe the same object in the world.
-      candidateKeyMatch: true,
-      matchedOn: Object.freeze([...new Set(observations.flatMap((row) => row.matchedOn))].sort()),
-      observations: Object.freeze(observations),
-    });
+  function entityHistory(query = {}) {
+    const { tokens, observationType, from, to, knowledgeTime } = prepareEntityHistoryQuery(query);
+    return matchTokens(tokens, { observationType, from, to, knowledgeTime });
   }
 
   /**
@@ -493,8 +331,7 @@ export function createMemoryObservationStore() {
    * the two answers must never be confused:
    *
    *   CAUSAL          latest element set whose epoch is at or before
-   *                   `eventTime`, and — when `knowledgeTime` is given — one
-   *                   PANOPTIC already held. Uses no knowledge of the future.
+   *                   `eventTime`. Uses no knowledge of the orbit's future.
    *                   This is the mode for "where could we have known it was?",
    *                   and the only mode admissible as evidence.
    *
@@ -505,6 +342,11 @@ export function createMemoryObservationStore() {
    *                   `usesFutureEpoch` says so on every result; a
    *                   reconstruction may be rendered and measured, never cited
    *                   for what was knowable at the time.
+   *
+   * THE MODE CHANGES EPOCH SELECTION AND NOTHING ELSE. Candidate matching and
+   * revision resolution happen first, identically, in both modes — a question
+   * about orbits is not a different theory of what supersedes what. See
+   * `selectElementSetEpoch` for the three selections kept apart.
    *
    * TWO DIFFERENT FUTURES, NEVER CONFLATED:
    *
@@ -521,9 +363,6 @@ export function createMemoryObservationStore() {
    *                       no future epoch, and is simply absent from any query
    *                       whose knowledge horizon precedes 15:00.
    *
-   * Ties on epoch distance resolve to the earlier epoch, then by knowledge, so
-   * the choice is deterministic.
-   *
    * @param {object} query - Query.
    * @param {object} query.keys - Candidate keys, e.g. `{noradId: 25544}`.
    * @param {number} query.eventTime - EVENT TIME to propagate to.
@@ -531,48 +370,24 @@ export function createMemoryObservationStore() {
    * @param {number} [query.knowledgeTime] - KNOWLEDGE TIME horizon.
    * @returns {object|null} `{row, mode, epochDeltaMs, usesFutureEpoch}` or null.
    */
-  function elementSetFor({ keys, eventTime, mode = ELEMENT_SET_MODES.CAUSAL, knowledgeTime } = {}) {
-    if (!Number.isFinite(eventTime)) throw new TypeError('elementSetFor requires a finite eventTime');
-    if (mode !== ELEMENT_SET_MODES.CAUSAL && mode !== ELEMENT_SET_MODES.RECONSTRUCTION) {
-      throw new TypeError(`unknown element set mode: ${JSON.stringify(mode)}`);
-    }
+  function elementSetFor(query = {}) {
+    const { tokens, eventTime, mode, knowledgeTime } = prepareElementSetQuery(query);
 
-    const candidates = entityHistory({ keys, observationType: 'space.orbital_elements', knowledgeTime })
-      .observations
-      .filter((row) => (mode === ELEMENT_SET_MODES.CAUSAL ? row.observedAt <= eventTime : true));
-    if (candidates.length === 0) return null;
-
-    let best = null;
-    for (const row of candidates) {
-      if (best === null) {
-        best = row;
-        continue;
-      }
-      if (mode === ELEMENT_SET_MODES.CAUSAL) {
-        // Latest epoch at or before eventTime; later knowledge breaks a tie.
-        if (byEventTime(best, row) < 0) best = row;
-      } else {
-        const delta = Math.abs(row.observedAt - eventTime);
-        const bestDelta = Math.abs(best.observedAt - eventTime);
-        if (delta < bestDelta || (delta === bestDelta && byEventTime(row, best) < 0)) best = row;
-      }
-    }
-
-    return Object.freeze({
-      row: best,
-      mode,
-      epochDeltaMs: best.observedAt - eventTime,
-      // ORBITAL hindsight only: the epoch is later than the moment asked about.
-      // Says nothing about when PANOPTIC learned of it — that is the
-      // knowledgeTime filter's job, and folding the two together here would
-      // make an element set held for hours look like knowledge from the future.
-      usesFutureEpoch: best.observedAt > eventTime,
+    // The same candidate match every other query uses: it applies the knowledge
+    // horizon and resolves revisions, so what reaches epoch selection is one row
+    // per state — already the version in force. Epoch selection is the only step
+    // that reads `mode`.
+    const { observations } = matchTokens(tokens, {
+      observationType: 'space.orbital_elements',
+      knowledgeTime,
     });
+
+    return buildElementSetResult(observations, { eventTime, mode });
   }
 
-  /** One stored row by id, or null. */
+  /** One stored row by id, or null when no such evidence is held. */
   function get(observationId) {
-    return byId.get(observationId) ?? null;
+    return byId.get(assertObservationId(observationId)) ?? null;
   }
 
   /** Number of distinct observations held. */
