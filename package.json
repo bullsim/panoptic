@@ -41,6 +41,9 @@
     "preview": "vite preview",
     "test": "node scripts/run-unit-tests.mjs",
     "test:track": "node scripts/track-regression.mjs",
+    "db:up": "docker compose up -d --wait evidence-db",
+    "db:down": "docker compose down -v",
+    "test:postgres": "node --env-file-if-exists=.env --test src/data/observationStorePostgres.test.mjs",
     "qa:map-source-tray": "node scripts/qa-map-source-tray.mjs"
   },
   "dependencies": {
@@ -49,6 +52,7 @@
     "egm96-universal": "^1.1.1",
     "mgrs": "^2.1.0",
     "pbf": "^5.1.2",
+    "pg": "^8.23.0",
     "satellite.js": "^6.0.2"
   },
   "devDependencies": {

@@ -1,0 +1,37 @@
+# PANOPTIC — disposable PostgreSQL for Evidence Store integration tests.
+#
+# PANOPTIC DOES NOT DEPEND ON THIS. `npm run dev` never starts it, `npm test`
+# stays green without it, and nothing in the running application reads a
+# database yet. It exists so `npm run test:postgres` has somewhere to run.
+#
+#     npm run db:up        start it and wait until it is healthy
+#     npm run test:postgres
+#     npm run db:down      stop and remove it, data volume included
+#
+# The image is the PostGIS family so the environment does not have to change
+# when spatial evidence semantics are eventually defined — but B2 activates no
+# PostGIS at all: no extension, no geometry column, no spatial index.
+services:
+  evidence-db:
+    # postgis/postgis:18-3.6 — PostgreSQL 18 with PostGIS 3.6, Debian-based,
+    # amd64, published 2026-08-31. Pinned to major+minor rather than :latest so
+    # the test database cannot change underneath a green run.
+    image: postgis/postgis:18-3.6
+    container_name: panoptic-evidence-db
+    environment:
+      POSTGRES_USER: panoptic
+      # No default: Compose fails fast rather than booting a known password.
+      POSTGRES_PASSWORD: ${PANOPTIC_DB_PASSWORD:?set PANOPTIC_DB_PASSWORD in .env}
+      POSTGRES_DB: panoptic_test
+    ports:
+      # Loopback ONLY — never reachable from the LAN. 54329 avoids colliding
+      # with any locally installed PostgreSQL on 5432.
+      - "127.0.0.1:54329:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U panoptic -d panoptic_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # NO VOLUME, deliberately. This database holds only disposable test schemas;
+    # every test drops its own. A durable dev database arrives with Slice C,
+    # when something in PANOPTIC actually reads one.
