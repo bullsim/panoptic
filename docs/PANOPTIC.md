@@ -69,12 +69,11 @@ enforced by tests.
 | **The conformance suite is the specification** | Behaviour is defined by an executable, adapter-neutral test suite, not by prose. |
 | **Browser payloads are not the canonical model** | What the globe receives is a rendering concern; Observation v1 is internal and server-side. |
 
-One further principle is an **architectural direction, not yet an implemented
-capability**: live visualisation should remain fully usable when persistence is
-unavailable. Today this holds trivially, because no collector writes to the
-Evidence Store at all. Making it hold once persistence is wired — so that a
-database outage degrades history without touching the live globe — is a
-requirement for the persistence slice, not something already built.
+One further principle is now **implemented for CelesTrak and enforced by tests**:
+live visualisation remains fully usable when persistence is unavailable. The HTTP
+response never waits for persistence, never fails because of it, and a database
+outage degrades history — `/health` reports `degraded` — without touching the
+live globe. For collectors that do not yet persist, it still holds trivially.
 
 ---
 
@@ -110,8 +109,8 @@ requirement for the persistence slice, not something already built.
             one implementation of the rules
                            │
                            ▼
-              PERSISTENCE INTEGRATION                  NOT YET WIRED
-        collectors writing evidence as it arrives
+              PERSISTENCE INTEGRATION                  CELESTRAK WIRED
+        collectors writing evidence as it arrives      FIRMS PLANNED
                            │
                            ▼
          HISTORICAL REPLAY / CORRELATION / ANALYSIS    PLANNED
@@ -120,10 +119,11 @@ requirement for the persistence slice, not something already built.
         PRESENTATION · Cesium globe · future analysis  GLOBE EXISTS
 ```
 
-The upper half of this diagram is built and tested. Everything from
-**persistence integration** downwards is not: collectors currently serve live
-data over HTTP and nothing writes to the Evidence Store. The globe exists, but it
-reads live collector responses, not stored evidence.
+The upper half of this diagram is built and tested. **Persistence integration**
+is wired for CelesTrak: each genuinely successful upstream refresh writes its
+orbital element sets to the Evidence Store. FIRMS is not persisted yet, and
+everything below persistence integration remains unbuilt. The globe exists, but
+it reads live collector responses, not stored evidence.
 
 ---
 
@@ -590,14 +590,16 @@ when its semantics are defined and testable, not before.
 | In-memory Evidence Store (reference implementation) |
 | Shared adapter-neutral semantics and conformance suite |
 | PostgreSQL adapter with verified conformance parity |
+| CelesTrak live persistence at the acquisition boundary |
+| Production database configuration (`PANOPTIC_DATABASE_URL`) and `db:init` |
+| Persistence health reporting in `/health` |
 
 **Not yet implemented**
 
 | Capability | Notes |
 |---|---|
-| Live collector persistence | Nothing writes evidence yet |
-| Production database configuration | No `PANOPTIC_DATABASE_URL` exists |
-| Persistence health reporting | Not in `/health` |
+| FIRMS persistence | Only CelesTrak persists today |
+| Durable spool or backfill | Persistence is best-effort; see below |
 | Historical replay API | No query surface exposed to the browser |
 | Spatial evidence queries | See section 13 |
 | Entity resolution | Candidate keys only |
@@ -605,6 +607,20 @@ when its semantics are defined and testable, not before.
 | Correlation and intelligence fusion | — |
 | Natural-language analysis layer | — |
 | TimescaleDB, raw evidence store | — |
+
+**Persistence is best-effort, and says so.** Delivery is *best-effort with
+bounded in-memory retry and idempotent insertion* — neither exactly-once nor
+durable at-least-once. There is no durable spool, so a process crash loses queued
+and in-flight batches, an outage beyond the retry budget loses evidence, and a
+saturated queue refuses new evidence rather than discarding evidence it has
+already accepted. Re-delivery is always safe: a repeated `observationId` is an
+idempotent insertion that cannot move Knowledge Time.
+
+One consequence is worth stating plainly: **the disk cache does not backfill the
+Evidence Store.** Promoting a cached body is not an acquisition, so if PANOPTIC
+acquires evidence, fails to persist it, and restarts before the next upstream
+refresh, that evidence is lost unless the same element sets are still upstream.
+A durable spool would address this, and is not built.
 
 ---
 
@@ -617,6 +633,18 @@ npm run dev      # globe + PANOPTIC backend; no PostgreSQL, no containers
 npm test         # full unit suite; PostgreSQL tests skip cleanly
 npm run build
 ```
+
+**Durable persistence is optional and explicit.** Set `PANOPTIC_DATABASE_URL`,
+then create the schema once:
+
+```
+npm run db:init        # create the evidence schema, deliberately
+```
+
+Normal startup only *verifies* the schema; it never creates or alters one, so a
+PANOPTIC start can never silently migrate a production database. An operator may
+run `db:init` with an administrative role holding DDL rights, and run PANOPTIC
+itself with a restricted role that may only `SELECT` and `INSERT`.
 
 **PostgreSQL integration testing** is explicit and opt-in:
 
@@ -657,7 +685,7 @@ Conceptual order, without dates or commitments to unmade decisions.
 | Evidence Store semantics | Done |
 | PostgreSQL parity | Done |
 | Architecture documentation | This document |
-| Live persistence integration | Next |
+| Live persistence integration | CelesTrak done; FIRMS next |
 | Spatial evidence queries | Later |
 | Historical replay API | Later |
 | Baselines and anomaly detection | Later |
@@ -690,6 +718,8 @@ takes belongs to the subsystem.
 | `server/storage/memory.js` | The reference implementation |
 | `server/storage/postgres/store.js` | The PostgreSQL adapter |
 | `server/storage/postgres/schema.js` | The physical schema and append-only enforcement |
+| `server/persistence/sink.js` | Admission, bounded FIFO, retry and pipeline state |
+| `server/persistence/runtime.js` | Persistence lifecycle, readiness and recovery |
 | `src/data/observationContract.test.mjs` | Contract tests and golden identity vectors |
 | `src/data/observationStoreConformance.mjs` | The adapter-neutral behavioural specification |
 | `src/data/observationStorePostgres.test.mjs` | PostgreSQL binding and database-specific tests |

@@ -97,15 +97,21 @@ export function routeRemainder(pathname, route) {
  * therefore affect only itself, and a test can build a context by passing one
  * small object.
  *
+ * A `sink` is passed through the same way, and is `null` unless a host supplies
+ * one. Only the standalone PANOPTIC server does: the Vite compatibility runtime
+ * in `server/index.js` constructs its runtimes without one, so a dev server can
+ * never write a second copy of the same evidence.
+ *
  * @param {readonly Collector[]} collectors - Collectors to instantiate.
  * @param {object} [options] - Runtime options.
  * @param {object} [options.config] - Loaded PANOPTIC configuration.
+ * @param {object|null} [options.sink] - Persistence sink, or null for none.
  * @returns {{mount: Function, dispatch: Function, routes: Function}} Runtime handle.
  */
-export function createRuntime(collectors, { config = null } = {}) {
+export function createRuntime(collectors, { config = null, sink = null } = {}) {
   const instances = collectors.map((collector) => ({
     collector,
-    context: collector.createContext({ config: config?.collectors?.[collector.id] ?? {} }),
+    context: collector.createContext({ config: config?.collectors?.[collector.id] ?? {}, sink }),
   }));
 
   return {

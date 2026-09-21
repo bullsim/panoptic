@@ -64,7 +64,7 @@ export default defineCollector({
    * @returns {{cache: ReturnType<typeof createTtlCache>, fetchImpl: typeof fetch, now: () => number}}
    */
   createContext(overrides = {}) {
-    const { log = console, cacheDir = CACHE_DIR(), ...rest } = overrides;
+    const { log = console, cacheDir = CACHE_DIR(), sink = null, ...rest } = overrides;
     return {
       cache: createTtlCache({
         dir: cacheDir,
@@ -73,6 +73,16 @@ export default defineCollector({
         validate: validEntry,
         label: 'celestrak-proxy',
         log,
+        // PERSISTENCE ATTACHES AT ACQUISITION, NOT AT REQUEST. This fires once
+        // per successful upstream refresh: never on a cache HIT, never when a
+        // stale copy is served, and exactly once when concurrent callers
+        // coalesce onto a single refresh. Each group is its own feed, so
+        // `stations` and `active` persist as separate batches.
+        //
+        // The hook itself lives with the normaliser below, because normalising
+        // is what it does. Without a sink the option is absent and this file
+        // behaves exactly as it did before persistence existed.
+        onRefresh: sink ? persistAcquisition(sink) : undefined,
       }),
       fetchImpl: (...args) => fetch(...args),
       now: () => Date.now(),
@@ -133,7 +143,9 @@ export default defineCollector({
 // ---------------------------------------------------------------------------
 // Observation v1 normaliser
 // ---------------------------------------------------------------------------
-// PURE and DELIBERATELY UNWIRED. The handler above must never call this.
+// PURE. The HANDLER must never call this — persistence is attached to the cache
+// refresh boundary above, not to a request, so that a response is never delayed
+// by normalisation and N coalesced callers produce ONE batch rather than N.
 //
 // The canonical observation is the ORBITAL ELEMENT SET — what CelesTrak
 // actually reports. A satellite position is a deterministic SGP4 projection of
@@ -324,4 +336,26 @@ export function toObservations(entry, { feed = null } = {}) {
     ],
     observations,
   };
+}
+
+/**
+ * The acquisition hook — offer one freshly refreshed group to persistence.
+ *
+ * Lives here rather than beside `createContext` because normalising is what it
+ * does, and the request path must contain no normalisation at all.
+ *
+ * NOTHING HERE RUNS ON A REQUEST. The cache calls this only after an upstream
+ * refresh has genuinely succeeded, in a later event-loop turn, once per refresh
+ * however many callers coalesced onto it. Normalisation happens inside
+ * `submit()`, so the sink contains a failure here instead of it reaching the
+ * cache, and the returned verdict is a plain object — never awaited by anyone.
+ *
+ * @param {{submit: Function}} sink - Persistence sink.
+ * @returns {(group: string, entry: {at: number, body: string}) => object} Hook.
+ */
+function persistAcquisition(sink) {
+  return (group, entry) => sink.submit(
+    `celestrak:${group}`,
+    () => toObservations(entry, { feed: group }),
+  );
 }

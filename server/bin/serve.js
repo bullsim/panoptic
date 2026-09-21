@@ -20,6 +20,7 @@
 import { pathToFileURL } from 'node:url';
 import { createStandaloneServer } from '../standalone.js';
 import { PanopticConfigError, loadPanopticConfig } from '../config/index.js';
+import { createPersistenceRuntime } from '../persistence/runtime.js';
 
 /**
  * Wire SIGINT/SIGTERM to a bounded graceful shutdown.
@@ -35,9 +36,15 @@ import { PanopticConfigError, loadPanopticConfig } from '../config/index.js';
  * @param {number} options.shutdownTimeoutMs - Grace period before forcing.
  * @param {NodeJS.Process} [options.proc] - Process to wire (injectable for tests).
  * @param {Pick<Console,'log'|'warn'>} [options.log] - Log sink.
+ * @param {object|null} [options.persistence] - Persistence runtime to drain, if any.
  * @returns {() => void} Detach the signal handlers.
  */
-export function installShutdown(server, { shutdownTimeoutMs, proc = process, log = console }) {
+export function installShutdown(server, {
+  shutdownTimeoutMs,
+  proc = process,
+  log = console,
+  persistence = null,
+}) {
   let closing = false;
 
   const onSignal = (signal) => {
@@ -57,10 +64,32 @@ export function installShutdown(server, { shutdownTimeoutMs, proc = process, log
     // Never let the grace timer itself hold the process open.
     forceTimer.unref?.();
 
-    server.close(() => {
+    const finish = () => {
       clearTimeout(forceTimer);
       log.log('[panoptic] closed cleanly');
       proc.exit(0);
+    };
+
+    server.close(() => {
+      if (!persistence) {
+        finish();
+        return;
+      }
+      // ONE EVENT-LOOP TURN FIRST. A request that completed a successful
+      // refresh queued its persistence submission with setImmediate, which has
+      // not run yet — closing admission here would silently discard the very
+      // evidence that request just acquired.
+      //
+      // The force timer stays armed across the drain, so a hung database still
+      // cannot make shutdown outlast the grace period.
+      setImmediate(async () => {
+        try {
+          await persistence.close({ timeoutMs: Math.min(shutdownTimeoutMs, 5_000) });
+        } catch (err) {
+          log.warn(`[panoptic] persistence shutdown error: ${err?.message || err}`);
+        }
+        finish();
+      });
     });
     // Keep-alive sockets are idle but open; without this, close() waits.
     server.closeIdleConnections();
@@ -75,9 +104,17 @@ export function installShutdown(server, { shutdownTimeoutMs, proc = process, log
 export async function main() {
   const config = loadPanopticConfig();
   const { host, port, shutdownTimeoutMs } = config.server;
-  const { server, routes } = createStandaloneServer({ config });
 
-  installShutdown(server, { shutdownTimeoutMs });
+  // Persistence is built before the server so collectors receive a sink, and
+  // made ready before listening so /health is truthful from the first request.
+  // The readiness attempt is BOUNDED: a database outage costs a few seconds of
+  // startup, never the live globe.
+  const persistence = createPersistenceRuntime({ config });
+  await persistence.start();
+
+  const { server, routes } = createStandaloneServer({ config, persistence });
+
+  installShutdown(server, { shutdownTimeoutMs, persistence });
 
   server.on('error', (err) => {
     const hint = err?.code === 'EADDRINUSE' ? ` — ${host}:${port} is already in use` : '';
@@ -94,6 +131,8 @@ export async function main() {
   for (const { id, route } of routes) {
     console.log(`[panoptic] collector ${id} → http://${shown}${route}`);
   }
+  // State only — never the target, never the credentials.
+  console.log(`[panoptic] persistence ${persistence.health().status}`);
 }
 
 // Only self-start when executed directly, never when imported by a test.

@@ -43,6 +43,7 @@
     "test:track": "node scripts/track-regression.mjs",
     "db:up": "docker compose up -d --wait evidence-db",
     "db:down": "docker compose down -v",
+    "db:init": "node server/bin/db-init.js",
     "test:postgres": "node --env-file-if-exists=.env --test src/data/observationStorePostgres.test.mjs",
     "qa:map-source-tray": "node scripts/qa-map-source-tray.mjs"
   },

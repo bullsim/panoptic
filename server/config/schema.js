@@ -90,6 +90,37 @@ export function coerceNonEmptyString(name, raw) {
   return value;
 }
 
+/**
+ * Coerce a PostgreSQL connection URL.
+ *
+ * THE VALUE NEVER APPEARS IN THE ERROR. Every other coercer here echoes what it
+ * received, which is exactly right for a port or a host and exactly wrong for a
+ * connection string: these carry a password, and a password in a startup error
+ * is a leaked password. The messages below describe the RULE that was broken and
+ * never the text that broke it.
+ *
+ * @param {string} name - Variable name, for the error message.
+ * @param {unknown} raw - Raw value.
+ * @returns {string} The connection URL, unchanged.
+ */
+export function coercePostgresUrl(name, raw) {
+  const value = String(raw).trim();
+  if (!value) throw new ConfigProblem(name, 'must not be empty');
+
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new ConfigProblem(name, 'must be a valid postgres:// connection URL');
+  }
+  if (url.protocol !== 'postgres:' && url.protocol !== 'postgresql:') {
+    throw new ConfigProblem(name, 'must use the postgres:// or postgresql:// scheme');
+  }
+  if (!url.hostname) throw new ConfigProblem(name, 'must name a host');
+  if (!url.pathname.replace(/^\//, '')) throw new ConfigProblem(name, 'must name a database');
+  return value;
+}
+
 /** Coerce a non-empty host string. */
 export function coerceHost(name, raw) {
   const value = String(raw).trim();
@@ -147,6 +178,21 @@ export const PANOPTIC_SCHEMA = Object.freeze([
     default: null,
     describe: 'NASA FIRMS MAP_KEY for live active-fire detections.',
     coerce: (name, raw) => coerceNonEmptyString(name, raw),
+  }),
+  Object.freeze({
+    // The durable Evidence Store. Optional: its absence disables persistence
+    // entirely — live collectors are unaffected and the server still starts,
+    // exactly as a missing FIRMS key degrades one collector rather than startup.
+    // `owner: 'evidence'` is deliberately NOT a collector id, so this value is
+    // never folded into a collector's slice; it builds `config.persistence`.
+    name: 'PANOPTIC_DATABASE_URL',
+    owner: 'evidence',
+    property: 'databaseUrl',
+    scope: 'server',
+    secret: true,
+    default: null,
+    describe: 'PostgreSQL connection URL for the durable Evidence Store.',
+    coerce: (name, raw) => coercePostgresUrl(name, raw),
   }),
   Object.freeze({
     name: 'PANOPTIC_SHUTDOWN_TIMEOUT_MS',

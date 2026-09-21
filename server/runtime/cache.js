@@ -32,9 +32,10 @@ import path from 'node:path';
  * @param {(entry: unknown) => boolean} options.validate - Guard for entries read from disk.
  * @param {string} options.label - Log prefix, e.g. `celestrak-proxy`.
  * @param {Pick<Console,'warn'>} [options.log] - Log sink (injectable for tests).
+ * @param {(key: string, entry: TtlCacheEntry) => unknown} [options.onRefresh] - Acquisition hook.
  * @returns {{read: (key: string) => Promise<TtlCacheEntry|null>, isFresh: (entry: TtlCacheEntry|null, now: number) => boolean, refresh: (key: string, loader: (key: string) => Promise<TtlCacheEntry>) => Promise<TtlCacheEntry|null>}}
  */
-export function createTtlCache({ dir, fileName, ttlMs, validate, label, log = console }) {
+export function createTtlCache({ dir, fileName, ttlMs, validate, label, log = console, onRefresh }) {
   /** @type {Map<string, TtlCacheEntry>} key -> entry */
   const mem = new Map();
   /** @type {Map<string, Promise<TtlCacheEntry|null>>} key -> in-flight refresh */
@@ -78,6 +79,34 @@ export function createTtlCache({ dir, fileName, ttlMs, validate, label, log = co
     }
   }
 
+  /**
+   * Tell the optional hook that fresh evidence was acquired.
+   *
+   * THE CACHE CONTAINS THE HOOK'S FAILURES ITSELF rather than trusting every
+   * caller to behave. A hook that throws synchronously, or returns a promise
+   * that rejects, must not turn a successful refresh into a failed one, must not
+   * reach the HTTP response, and must not surface as an unhandled rejection.
+   *
+   * `setImmediate` puts it in a later turn, which does two things at once: the
+   * response already being written is never delayed by the hook's work, and a
+   * synchronous throw cannot reach the refresh promise at all.
+   */
+  function notifyRefresh(key, entry) {
+    if (!onRefresh) return;
+    setImmediate(() => {
+      try {
+        const result = onRefresh(key, entry);
+        if (result && typeof result.then === 'function') {
+          result.then(undefined, (err) => {
+            log.warn(`[${label}] ${key} refresh hook rejected (${err?.message || err})`);
+          });
+        }
+      } catch (err) {
+        log.warn(`[${label}] ${key} refresh hook threw (${err?.message || err})`);
+      }
+    });
+  }
+
   return {
     /** Newest known entry for a key — memory first, then promoting from disk. */
     async read(key) {
@@ -105,6 +134,7 @@ export function createTtlCache({ dir, fileName, ttlMs, validate, label, log = co
           .then(async (fresh) => {
             mem.set(key, fresh);
             await writeDisk(key, fresh);
+            notifyRefresh(key, fresh);
             return fresh;
           })
           .catch((err) => {

@@ -149,10 +149,19 @@ export function loadPanopticConfig({
     collectors[id] = Object.freeze(slice);
   }
 
+  // The durable Evidence Store is not a collector, so it gets its own section
+  // rather than a slice of `collectors`. Absent is a normal, supported state:
+  // persistence is simply disabled and every live collector is unaffected.
+  const databaseUrl = values.PANOPTIC_DATABASE_URL ?? null;
+
   return Object.freeze({
     mode: resolvedMode,
     // Paths only — never values. Useful when a setting came from an unexpected file.
     envFiles: Object.freeze(files),
+    persistence: Object.freeze({
+      configured: databaseUrl !== null,
+      databaseUrl: databaseUrl === null ? null : secret(databaseUrl),
+    }),
     server: Object.freeze({
       host: address.host,
       port: address.port,

@@ -37,17 +37,21 @@ export const HEALTH_ROUTE = '/health';
 export function createStandaloneServer({
   collectors = COLLECTORS,
   config = null,
+  persistence = null,
   now = () => Date.now(),
   log = console,
 } = {}) {
-  const runtime = createRuntime(collectors, { config });
+  // Only this host owns persistence. The Vite compatibility runtime builds its
+  // own collectors with no sink, so there is never a second writer.
+  const runtime = createRuntime(collectors, { config, sink: persistence?.sink ?? null });
   // Configuration STATE only — an enum per collector, never a value. CelesTrak
   // needs no configuration at all, which reports as 'not-required'.
   const routes = runtime.routes(SURFACE).map((route) => ({
     ...route,
     configuration: config?.collectors?.[route.id]?.configuration ?? 'not-required',
   }));
-  const degraded = routes.some((r) => r.configuration === 'missing' || r.configuration === 'invalid');
+  const configurationDegraded = routes
+    .some((r) => r.configuration === 'missing' || r.configuration === 'invalid');
   const startedAt = now();
 
   const server = http.createServer(async (req, res) => {
@@ -55,9 +59,18 @@ export function createStandaloneServer({
       const pathname = String(req.url || '').split('?')[0];
 
       if (pathname === HEALTH_ROUTE) {
+        // Persistence state is read PER REQUEST because it changes while the
+        // process runs, unlike collector configuration which is fixed at
+        // construction. The fragment is bounded and carries no connection
+        // string, host, user, schema name or database error.
+        const persistenceHealth = persistence ? persistence.health() : null;
+        // The live globe still works when evidence retention is impaired, so
+        // this is `degraded` — never `error`.
+        const degraded = configurationDegraded || persistenceHealth?.status === 'unavailable';
+
         // Enough to establish the backend is alive and what it is serving.
         // Deliberately not an observability surface.
-        sendJson(res, 200, {
+        const body = {
           status: degraded ? 'degraded' : 'ok',
           service: 'panoptic',
           surface: SURFACE,
@@ -65,7 +78,12 @@ export function createStandaloneServer({
           startedAt: new Date(startedAt).toISOString(),
           uptimeSeconds: Math.round((now() - startedAt) / 1000),
           collectors: routes,
-        });
+        };
+        // Absent entirely when no persistence runtime was supplied, so the
+        // health contract is unchanged for every existing host and test.
+        if (persistenceHealth) body.persistence = persistenceHealth;
+
+        sendJson(res, 200, body);
         return;
       }
 

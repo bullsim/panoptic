@@ -54,7 +54,10 @@ const load = (dir, processEnv = {}, extra = {}) =>
 test('the schema declares only PANOPTIC-owned variables', () => {
   assert.deepEqual(
     [...PANOPTIC_SCHEMA.map((e) => e.name)].sort(),
-    ['FIRMS_MAP_KEY', 'PANOPTIC_HOST', 'PANOPTIC_PORT', 'PANOPTIC_SHUTDOWN_TIMEOUT_MS'],
+    [
+      'FIRMS_MAP_KEY', 'PANOPTIC_DATABASE_URL', 'PANOPTIC_HOST', 'PANOPTIC_PORT',
+      'PANOPTIC_SHUTDOWN_TIMEOUT_MS',
+    ],
   );
   // FIRMS_MAP_KEY entered the schema in the same commit that moved the FIRMS
   // collector into server/. Everything below is STILL read by vite.config.js
@@ -302,8 +305,86 @@ test('defaults apply when nothing is configured', () => {
     PANOPTIC_PORT: 8787,
     // Optional secret: absent is a default of null, never a startup failure.
     FIRMS_MAP_KEY: null,
+    // Likewise: no database configured means persistence is simply disabled.
+    PANOPTIC_DATABASE_URL: null,
     PANOPTIC_SHUTDOWN_TIMEOUT_MS: 10_000,
   });
+});
+
+// ---------------------------------------------------------------------------
+// Evidence Store configuration
+// ---------------------------------------------------------------------------
+
+test('persistence is disabled when no database is configured', async () => {
+  const { dir, cleanup } = await envDir();
+  try {
+    const config = load(dir, {});
+    assert.deepEqual(config.persistence, { configured: false, databaseUrl: null });
+    // Absence is a supported state, not a problem to report.
+    assert.equal(config.server.port, 8787, 'startup configuration is unaffected');
+  } finally { await cleanup(); }
+});
+
+test('a configured database URL is stored as a secret and never renders', async () => {
+  const { dir, cleanup } = await envDir();
+  const URL_WITH_PASSWORD = 'postgres://panoptic:SYNTHETIC-DB-PASSWORD-7731@127.0.0.1:54329/panoptic';
+  try {
+    const config = load(dir, { PANOPTIC_DATABASE_URL: URL_WITH_PASSWORD });
+    assert.equal(config.persistence.configured, true);
+    assert.equal(isSecret(config.persistence.databaseUrl), true, 'a connection string must arrive boxed');
+    assert.equal(config.persistence.databaseUrl.reveal(), URL_WITH_PASSWORD);
+
+    // No rendering of the whole config may expose the URL or the password.
+    for (const rendering of [JSON.stringify(config), inspect(config, { depth: 8 })]) {
+      assert.equal(rendering.includes(URL_WITH_PASSWORD), false, 'the URL must never render');
+      assert.equal(rendering.includes('SYNTHETIC-DB-PASSWORD-7731'), false, 'the password must never render');
+    }
+    // And it is not handed to any collector.
+    assert.deepEqual(config.collectors.celestrak, { configuration: 'not-required' });
+  } finally { await cleanup(); }
+});
+
+test('a malformed database URL is fatal and never echoes the value', async () => {
+  const { dir, cleanup } = await envDir();
+  // Every one carries a password, which must not reach the error message.
+  const bad = [
+    'not-a-url-at-all',
+    'mysql://panoptic:SYNTHETIC-DB-PASSWORD-7731@127.0.0.1:3306/panoptic',
+    'postgres://panoptic:SYNTHETIC-DB-PASSWORD-7731@127.0.0.1:54329',
+    'postgres://panoptic:SYNTHETIC-DB-PASSWORD-7731@/panoptic',
+  ];
+  try {
+    for (const value of bad) {
+      assert.throws(() => load(dir, { PANOPTIC_DATABASE_URL: value }), (err) => {
+        assert.ok(err instanceof PanopticConfigError, `${value} should be fatal`);
+        assert.match(err.message, /PANOPTIC_DATABASE_URL/);
+        // THE WHOLE POINT: a connection string in a startup error is a leaked
+        // password, so the message describes the rule, never the value.
+        assert.equal(err.message.includes('SYNTHETIC-DB-PASSWORD-7731'), false,
+          'the password must never appear in a configuration error');
+        assert.equal(err.message.includes(value), false,
+          'the supplied value must never be echoed');
+        return true;
+      });
+    }
+    // Whitespace-only is absent, not malformed — matching every other optional.
+    assert.equal(load(dir, { PANOPTIC_DATABASE_URL: '   ' }).persistence.configured, false);
+  } finally { await cleanup(); }
+});
+
+test('the database URL follows the same precedence and mutates nothing', async () => {
+  const FILE_URL = 'postgres://panoptic:from-file@127.0.0.1:54329/panoptic';
+  const ENV_URL = 'postgres://panoptic:from-environment@127.0.0.1:54329/panoptic';
+  const { dir, cleanup } = await envDir({ '.env': `PANOPTIC_DATABASE_URL=${FILE_URL}\n` });
+  try {
+    assert.equal(load(dir, {}).persistence.databaseUrl.reveal(), FILE_URL);
+    // The real environment is the production case and still wins.
+    assert.equal(
+      load(dir, { PANOPTIC_DATABASE_URL: ENV_URL }).persistence.databaseUrl.reveal(),
+      ENV_URL,
+    );
+    assert.equal(process.env.PANOPTIC_DATABASE_URL, undefined, 'process.env must not be touched');
+  } finally { await cleanup(); }
 });
 
 test('the mode defaults to development and follows NODE_ENV', () => {
